@@ -1,3 +1,5 @@
+mod stt;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -197,6 +199,7 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .manage(stt::Stt::default())
         .invoke_handler(tauri::generate_handler![
             get_api_key,
             set_api_key,
@@ -206,7 +209,8 @@ pub fn run() {
             create_project,
             list_dir,
             read_file,
-            write_file
+            write_file,
+            stt::transcribe_local,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

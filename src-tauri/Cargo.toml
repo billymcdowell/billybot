@@ -25,6 +25,7 @@ serde_json = "1"
 tauri-plugin-dialog = "2"
 tauri-plugin-store = "2"
 keyring = "4"
+whisper-rs = { version = "0.16", features = ["metal"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
@@ -34,3 +35,7 @@ lto = true
 opt-level = 3
 panic = "abort"
 strip = true
+
+# Build whisper.cpp optimised even in dev builds; unoptimised it is far too slow.
+[profile.dev.package.whisper-rs-sys]
+opt-level = 3
