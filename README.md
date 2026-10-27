@@ -42,7 +42,7 @@ npm run tauri build
 Speech-to-text runs locally with [whisper.cpp](https://github.com/ggml-org/whisper.cpp). Download `ggml-base.en.bin` from [ggerganov/whisper.cpp on Hugging Face](https://huggingface.co/ggerganov/whisper.cpp) and place it at:
 
 ```
-~/Library/Application Support/com.example.billybot/models/ggml-base.en.bin
+~/Library/Application Support/uk.billymcdowell.billybot/models/ggml-base.en.bin
 ```
 
 Change the model by editing `MODEL_FILE` in `src-tauri/src/stt.rs`.
