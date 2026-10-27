@@ -4,6 +4,7 @@ import type {
   ChatCompletionMessageParam,
   ChatCompletionTool,
 } from "openai/resources/chat/completions";
+import { clipInstructions, formatInstructions, INSTRUCTIONS_FILE, type ProjectInstructions } from "./instructions";
 import { checkPermission, type AskFn } from "./permissions";
 import type { Mode, OpenProject, SubagentRun } from "./storage";
 
@@ -128,19 +129,44 @@ export type AgentOptions = {
   who?: string; // shown on approval cards
 };
 
-export function systemPrompt(o: Pick<AgentOptions, "role" | "projects" | "workspace">): string {
+/**
+ * Reads each project's CLAUDE.md, if it has one. It goes through the same locked read_file as
+ * the agent's own reads, so a CLAUDE.md that is a symlink to somewhere else is refused.
+ */
+export async function loadInstructions(workspace: string, projects: OpenProject[]): Promise<ProjectInstructions[]> {
+  const found = await Promise.all(
+    projects.map(async (p) => {
+      try {
+        const text = clipInstructions(
+          await invoke<string>("read_file", { workspace, project: p.name, path: INSTRUCTIONS_FILE }),
+        );
+        return text ? { project: p.name, text } : null;
+      } catch {
+        return null; // this project has no CLAUDE.md
+      }
+    }),
+  );
+  return found.filter((x): x is ProjectInstructions => x !== null);
+}
+
+export function systemPrompt(
+  o: Pick<AgentOptions, "role" | "projects" | "workspace">,
+  instructions: ProjectInstructions[] = [],
+): string {
+  const notes = formatInstructions(instructions);
+  const withNotes = (prompt: string) => (notes ? `${prompt}\n\n${notes}` : prompt);
   const open = o.projects.length
     ? o.projects.map((p) => `${p.name} (${p.writable ? "writable" : "read-only"})`).join(", ")
     : "none";
   if (o.role === "sub") {
     const p = o.projects[0].name;
-    return (
+    return withNotes(
       `You are a subagent working only in the project "${p}". Every path starts with "${p}/". ` +
-      "Complete the task, then reply with a short report: what you changed (list the files) and anything you could not do. " +
-      "You cannot ask questions; if you are blocked, explain what you need in your report."
+        "Complete the task, then reply with a short report: what you changed (list the files) and anything you could not do. " +
+        "You cannot ask questions; if you are blocked, explain what you need in your report.",
     );
   }
-  return [
+  return withNotes([
     "You are a coding assistant. You work inside a workspace folder that holds one folder per project.",
     `Workspace: ${o.workspace}`,
     `Open projects: ${open}`,
@@ -151,7 +177,7 @@ export function systemPrompt(o: Pick<AgentOptions, "role" | "projects" | "worksp
     `Open projects read-only unless you need to change them. At most ${MAX_OPEN_PROJECTS} can be open; close ones you no longer need.`,
     "For larger jobs spanning projects, use delegate_task to give each project its own subagent, and include any shared contract in each task.",
     "Be concise.",
-  ].join("\n");
+  ].join("\n"));
 }
 
 // ---------- Paths and permission targets ----------
@@ -355,7 +381,9 @@ export async function runAgent(o: AgentOptions): Promise<ChatCompletionMessagePa
 
   for (let step = 0; step < MAX_STEPS; step++) {
     // 1. Send the conversation (with a fresh system prompt) and stream the reply.
-    const system: ChatCompletionMessageParam = { role: "system", content: systemPrompt(o) };
+    // The projects (and so their CLAUDE.md files) can change between steps, so read them each time.
+    const instructions = await loadInstructions(o.workspace, o.projects);
+    const system: ChatCompletionMessageParam = { role: "system", content: systemPrompt(o, instructions) };
     const stream = await client.chat.completions.create(
       { model: o.model, messages: [system, ...messages], tools, stream: true },
       { signal: o.signal },

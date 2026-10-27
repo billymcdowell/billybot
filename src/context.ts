@@ -8,7 +8,7 @@ const PER_MESSAGE_OVERHEAD = 4; // role markers and formatting around each messa
 export const estimateTokens = (text: string) => Math.ceil(text.length / CHARS_PER_TOKEN);
 
 export type ContextPart = {
-  id: "messages" | "results" | "system" | "tools" | "free";
+  id: "messages" | "results" | "system" | "instructions" | "tools" | "free";
   label: string;
   tokens: number;
 };
@@ -30,6 +30,7 @@ function contentText(content: unknown): string {
 type Input = {
   systemText: string; // the system prompt
   toolsText: string; // the tool definitions, as JSON
+  instructionsText?: string; // the open projects' CLAUDE.md notes, as added to the prompt
   messages: ChatCompletionMessageParam[];
   streaming?: string; // reply text still arriving
   window: number | null; // the model's context size, if known
@@ -55,6 +56,9 @@ export function contextBreakdown(input: Input): ContextBreakdown {
     { id: "messages", label: "Messages", tokens: messages },
     { id: "results", label: "Tool results", tokens: results },
     { id: "system", label: "System prompt", tokens: estimateTokens(input.systemText) },
+    ...(input.instructionsText
+      ? [{ id: "instructions" as const, label: "Project instructions", tokens: estimateTokens(input.instructionsText) }]
+      : []),
     { id: "tools", label: "Tool definitions", tokens: estimateTokens(input.toolsText) },
   ];
   const used = parts.reduce((sum, p) => sum + p.tokens, 0);

@@ -548,6 +548,24 @@ mod tests {
     }
 
     #[test]
+    fn claude_md_is_read_normally_but_not_through_a_symlink_out_of_the_project() {
+        let ws = workspace("claude-md");
+        let note = format!("{ws}/proj/CLAUDE.md");
+        // A missing file is simply "no instructions".
+        assert!(read_file(ws.clone(), "proj".into(), "CLAUDE.md".into()).is_err());
+        // A normal file is read.
+        fs::write(&note, "Use tabs.").unwrap();
+        assert_eq!(read_file(ws.clone(), "proj".into(), "CLAUDE.md".into()).unwrap(), "Use tabs.");
+        // A CLAUDE.md that is really a link to a private file elsewhere must not be read, or its
+        // contents would be sent to the model.
+        fs::remove_file(&note).unwrap();
+        fs::write(format!("{ws}/secret.txt"), "top secret").unwrap();
+        std::os::unix::fs::symlink(format!("{ws}/secret.txt"), &note).unwrap();
+        let result = read_file(ws, "proj".into(), "CLAUDE.md".into());
+        assert!(result.is_err(), "the symlink was followed: {result:?}");
+    }
+
+    #[test]
     fn command_needs_a_real_project() {
         let ws = workspace("cmd-noproject");
         assert!(project_root(&ws, "../etc").is_err());

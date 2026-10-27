@@ -12,6 +12,7 @@ const COLORS: Record<ContextPart["id"], string> = {
   messages: "bg-blue-500",
   results: "bg-orange-500",
   system: "bg-amber-500",
+  instructions: "bg-violet-500",
   tools: "bg-emerald-500",
   free: "bg-muted-foreground/25",
 };

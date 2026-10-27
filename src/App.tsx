@@ -8,6 +8,7 @@ import {
   ChevronDownIcon,
   EyeIcon,
   FilePenIcon,
+  FileTextIcon,
   FolderIcon,
   FolderPlusIcon,
   MicIcon,
@@ -69,9 +70,10 @@ import {
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { DEFAULT_MODEL, runAgent, systemPrompt, textOf, toolsFor } from "./agent";
+import { DEFAULT_MODEL, loadInstructions, runAgent, systemPrompt, textOf, toolsFor } from "./agent";
 import ContextMeter from "./ContextMeter";
 import { contextBreakdown } from "./context";
+import { formatInstructions, type ProjectInstructions } from "./instructions";
 import DiffView from "./DiffView";
 import ModelPicker from "./ModelPicker";
 import { fetchToolModels } from "./models";
@@ -137,6 +139,17 @@ export default function App() {
   const [polishOn, setPolishOn] = useState(true);
   const recordingRef = useRef<Promise<Recording> | null>(null);
   const [contextWindow, setContextWindow] = useState<number | null>(null);
+  const [instructions, setInstructions] = useState<ProjectInstructions[]>([]); // CLAUDE.md of the open projects
+
+  // Look for a CLAUDE.md in each open project, so you can see which ones the agent is following.
+  useEffect(() => {
+    if (!workspace) return;
+    let current = true;
+    loadInstructions(workspace, projects).then((list) => current && setInstructions(list));
+    return () => {
+      current = false;
+    };
+  }, [workspace, projects]);
   const [lastUsage, setLastUsage] = useState<{ promptTokens: number; completionTokens: number } | null>(null);
 
   // The selected model's context size comes from OpenRouter's model list (fetched once and cached).
@@ -157,11 +170,12 @@ export default function App() {
       contextBreakdown({
         systemText: systemPrompt({ role: "main", projects, workspace: workspace ?? "" }),
         toolsText: JSON.stringify(toolsFor("main")),
+        instructionsText: formatInstructions(instructions),
         messages,
         streaming,
         window: contextWindow,
       }),
-    [projects, workspace, messages, streaming, contextWindow],
+    [projects, workspace, instructions, messages, streaming, contextWindow],
   );
 
   // On startup: read the key from Keychain and restore settings.
@@ -508,10 +522,15 @@ export default function App() {
                     variant={p.writable ? "default" : "outline"}
                     onClick={() => toggleWritable(p.name)}
                     disabled={busy}
-                    title="Switch between read-only and writable"
+                    title={
+                      instructions.some((i) => i.project === p.name)
+                        ? "Switch between read-only and writable. Its CLAUDE.md is part of the agent's instructions."
+                        : "Switch between read-only and writable"
+                    }
                   >
                     {p.writable ? <PencilIcon /> : <EyeIcon />}
                     {p.name}
+                    {instructions.some((i) => i.project === p.name) && <FileTextIcon aria-label="Has CLAUDE.md" />}
                   </Button>
                   <Button
                     size="icon-xs"
