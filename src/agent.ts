@@ -5,83 +5,268 @@ import type {
   ChatCompletionTool,
 } from "openai/resources/chat/completions";
 import { checkPermission, type AskFn } from "./permissions";
-import type { Mode } from "./storage";
+import type { Mode, OpenProject, SubagentRun } from "./storage";
 
 export const DEFAULT_MODEL = "anthropic/claude-sonnet-5.5";
-const MAX_STEPS = 25; // safety stop so a confused model can't loop forever
+// Model for subagents. Empty = same as the main agent. A cheaper model saves money.
+export const SUBAGENT_MODEL = "";
+const MAX_STEPS = 25; // per agent, so a confused model can't loop forever
+const MAX_OPEN_PROJECTS = 3;
+const MAX_SUBAGENTS_PER_TURN = 3;
+
+/** Message content can be a string or a list of parts; this returns the text. */
+export function textOf(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((p) => (p && p.type === "text" ? p.text : "")).join("");
+  }
+  return "";
+}
 
 // ---------- Tool definitions the model sees ----------
 
-const pathParam = {
+const fn = (name: string, description: string, properties: object, required: string[]) =>
+  ({
+    type: "function",
+    function: { name, description, parameters: { type: "object", properties, required } },
+  }) as ChatCompletionTool;
+
+const path = {
   type: "string",
-  description: "Path relative to the project folder. Use . for the folder itself.",
+  description: 'Starts with an open project\'s name, e.g. "my-app/src/index.ts". Use "my-app" for its root.',
 };
 
-export const TOOLS: ChatCompletionTool[] = [
-  {
-    type: "function",
-    function: {
-      name: "list_dir",
-      description: "List files and folders at a path. Folder names end with /.",
-      parameters: { type: "object", properties: { path: pathParam }, required: ["path"] },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "read_file",
-      description: "Read a text file and return its contents.",
-      parameters: { type: "object", properties: { path: pathParam }, required: ["path"] },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "write_file",
-      description:
-        "Create or overwrite a text file with the full new contents. Read the file first when changing it.",
-      parameters: {
-        type: "object",
-        properties: { path: pathParam, content: { type: "string" } },
-        required: ["path", "content"],
-      },
-    },
-  },
+const FILE_TOOLS = [
+  fn("list_dir", "List files and folders. Folder names end with /.", { path }, ["path"]),
+  fn("read_file", "Read a text file.", { path }, ["path"]),
+  fn(
+    "write_file",
+    "Create or overwrite a text file with its full new contents. Read it first when changing it. The project must be open as writable.",
+    { path, content: { type: "string" } },
+    ["path", "content"],
+  ),
 ];
 
-// ---------- Running a tool = calling the Rust command ----------
+const PROJECT_TOOLS = [
+  fn("list_projects", "List the projects in the workspace with their README summary.", {}, []),
+  fn(
+    "open_project",
+    "Open an existing project. Read-only by default; pass writable: true only if you need to change it. Opening again changes its access.",
+    { name: { type: "string" }, writable: { type: "boolean" } },
+    ["name"],
+  ),
+  fn("close_project", "Close a project you no longer need.", { name: { type: "string" } }, ["name"]),
+  fn(
+    "create_project",
+    "Create a new, empty project folder and open it as writable. Only when no existing project fits. Names: letters, numbers, - and _.",
+    { name: { type: "string" } },
+    ["name"],
+  ),
+  fn(
+    "delegate_task",
+    "Hand a self-contained task in one project to a subagent. It gets write access to that project only, works on its own, and returns a report. Calls made in the same turn run in parallel.",
+    {
+      project: { type: "string" },
+      task: {
+        type: "string",
+        description: "Everything the subagent needs: the goal, constraints, and any shared contract such as data shapes or URLs. It cannot ask you questions.",
+      },
+    },
+    ["project", "task"],
+  ),
+];
 
-async function runTool(name: string, args: Record<string, unknown>, folder: string) {
-  switch (name) {
-    case "list_dir": {
-      const names = await invoke<string[]>("list_dir", { root: folder, path: args.path });
-      return names.join("\n") || "(empty folder)";
-    }
-    case "read_file":
-      return invoke<string>("read_file", { root: folder, path: args.path });
-    case "write_file":
-      return invoke<string>("write_file", {
-        root: folder,
-        path: args.path,
-        content: args.content,
-      });
-    default:
-      throw new Error(`Unknown tool: ${name}`);
-  }
-}
-
-// ---------- The agent loop ----------
+// ---------- Options ----------
 
 export type AgentOptions = {
   apiKey: string;
   model: string;
-  folder: string;
-  getMode: () => Mode; // read fresh each call, so switching modes mid-run works
+  workspace: string;
+  projects: OpenProject[]; // this agent's open projects; its tools change this list
+  onProjectsChange?: (projects: OpenProject[]) => void;
+  getMode: () => Mode;
   messages: ChatCompletionMessageParam[]; // history, ending with the new user message
-  ask: AskFn; // shows the approval prompt
+  ask: AskFn;
   onUpdate: (messages: ChatCompletionMessageParam[], streamingText: string) => void;
-  signal?: AbortSignal; // lets the Stop button cancel
+  onSubagent?: (callId: string, run: SubagentRun) => void; // progress of subagents
+  signal?: AbortSignal;
+  role?: "main" | "sub";
+  who?: string; // shown on approval cards
 };
+
+function systemPrompt(o: AgentOptions): string {
+  const open = o.projects.length
+    ? o.projects.map((p) => `${p.name} (${p.writable ? "writable" : "read-only"})`).join(", ")
+    : "none";
+  if (o.role === "sub") {
+    const p = o.projects[0].name;
+    return (
+      `You are a subagent working only in the project "${p}". Every path starts with "${p}/". ` +
+      "Complete the task, then reply with a short report: what you changed (list the files) and anything you could not do. " +
+      "You cannot ask questions; if you are blocked, explain what you need in your report."
+    );
+  }
+  return [
+    "You are a coding assistant. You work inside a workspace folder that holds one folder per project.",
+    `Workspace: ${o.workspace}`,
+    `Open projects: ${open}`,
+    "Every file path starts with a project name, e.g. \"my-app/src/index.ts\".",
+    "When a task starts, call list_projects to find the right project and open it. Create a project only if nothing fits.",
+    `Open projects read-only unless you need to change them. At most ${MAX_OPEN_PROJECTS} can be open; close ones you no longer need.`,
+    "For larger jobs spanning projects, use delegate_task to give each project its own subagent, and include any shared contract in each task.",
+    "Be concise.",
+  ].join("\n");
+}
+
+// ---------- Paths and permission targets ----------
+
+/** "bakery/src/a.ts" → { project: "bakery", rest: "src/a.ts" } */
+function splitPath(p: string) {
+  const clean = p.replace(/^(\.\/|\/)+/, "");
+  const slash = clean.indexOf("/");
+  return slash === -1
+    ? { project: clean, rest: "" }
+    : { project: clean.slice(0, slash), rest: clean.slice(slash + 1) };
+}
+
+/** Checks a file-tool path against the open projects. Throws a helpful error if not allowed. */
+function openProjectFor(tool: string, p: string, o: AgentOptions) {
+  const { project, rest } = splitPath(p);
+  const open = o.projects.find((x) => x.name === project);
+  if (!open) {
+    const names = o.projects.map((x) => x.name).join(", ") || "none";
+    throw new Error(`"${project}" is not open. Paths must start with an open project (open: ${names}).`);
+  }
+  if (tool === "write_file" && !open.writable) {
+    throw new Error(`${project} is open read-only. Call open_project with writable: true to change it.`);
+  }
+  return { project, rest };
+}
+
+// ---------- Running one tool call ----------
+
+async function execute(
+  call: { id: string; name: string; args: string },
+  o: AgentOptions,
+  delegateSlot: number,
+): Promise<string> {
+  try {
+    const args = JSON.parse(call.args || "{}");
+    const isFileTool = ["list_dir", "read_file", "write_file"].includes(call.name);
+    const target = isFileTool ? openProjectFor(call.name, String(args.path ?? ""), o) : null;
+
+    // Permission: per project for file tools, per workspace for create_project.
+    const where = target ? target.project : "workspace";
+    const scope = target ? `${o.workspace}/${target.project}` : o.workspace;
+    const who = o.who ?? "Main agent";
+    const refusal = await checkPermission({ tool: call.name, args, who, where }, o.getMode(), scope, o.ask);
+    if (refusal) return refusal;
+
+    switch (call.name) {
+      case "list_dir": {
+        const names = await invoke<string[]>("list_dir", { workspace: o.workspace, ...pp(target) });
+        return names.join("\n") || "(empty folder)";
+      }
+      case "read_file":
+        return await invoke<string>("read_file", { workspace: o.workspace, ...pp(target) });
+      case "write_file":
+        return await invoke<string>("write_file", {
+          workspace: o.workspace,
+          ...pp(target),
+          content: String(args.content ?? ""),
+        });
+      case "list_projects":
+        return await listProjects(o);
+      case "open_project":
+        return await openProject(String(args.name), args.writable === true, o);
+      case "close_project": {
+        o.projects.splice(0, o.projects.length, ...o.projects.filter((p) => p.name !== args.name));
+        o.onProjectsChange?.([...o.projects]);
+        return `Closed ${args.name}.`;
+      }
+      case "create_project": {
+        const name = await invoke<string>("create_project", { workspace: o.workspace, name: String(args.name) });
+        return `Created ${name}. ` + (await openProject(name, true, o));
+      }
+      case "delegate_task":
+        if (delegateSlot >= MAX_SUBAGENTS_PER_TURN) {
+          return `Refused: at most ${MAX_SUBAGENTS_PER_TURN} subagents per turn. Run this one later.`;
+        }
+        return await runSubagent(call.id, String(args.project), String(args.task), o);
+      default:
+        throw new Error(`Unknown tool: ${call.name}`);
+    }
+  } catch (e) {
+    return `Error: ${e instanceof Error ? e.message : String(e)}`;
+  }
+}
+
+const pp = (t: { project: string; rest: string } | null) => ({ project: t!.project, path: t!.rest });
+
+async function listProjects(o: AgentOptions) {
+  type Info = { name: string; modified: number; summary: string };
+  const list = await invoke<Info[]>("list_projects", { workspace: o.workspace });
+  if (list.length === 0) return "(no projects yet)";
+  return list
+    .map((p) => {
+      const date = new Date(p.modified * 1000).toISOString().slice(0, 10);
+      const open = o.projects.some((x) => x.name === p.name) ? " [open]" : "";
+      return `${p.name}${open} · changed ${date}${p.summary ? " · " + p.summary : ""}`;
+    })
+    .join("\n");
+}
+
+async function openProject(name: string, writable: boolean, o: AgentOptions) {
+  await invoke("check_project", { workspace: o.workspace, name }); // throws if it isn't a real project
+  const existing = o.projects.find((p) => p.name === name);
+  if (existing) {
+    existing.writable = writable;
+  } else {
+    if (o.projects.length >= MAX_OPEN_PROJECTS) {
+      return `Could not open ${name}: ${MAX_OPEN_PROJECTS} projects are already open. Close one first.`;
+    }
+    o.projects.push({ name, writable });
+  }
+  o.onProjectsChange?.([...o.projects]);
+  return `Opened ${name} (${writable ? "writable" : "read-only"}).`;
+}
+
+// ---------- Subagents ----------
+
+async function runSubagent(callId: string, project: string, task: string, o: AgentOptions) {
+  if (o.role === "sub") throw new Error("Subagents cannot delegate.");
+  await invoke("check_project", { workspace: o.workspace, name: project });
+
+  const run: SubagentRun = { project, task, status: "running", messages: [{ role: "user", content: task }] };
+  const report = () => o.onSubagent?.(callId, { ...run, messages: [...run.messages] });
+  report();
+
+  try {
+    run.messages = await runAgent({
+      ...o, // same key, workspace, mode, approvals and Stop signal
+      model: SUBAGENT_MODEL || o.model,
+      role: "sub",
+      who: `${project} agent`,
+      projects: [{ name: project, writable: true }],
+      onProjectsChange: undefined,
+      onSubagent: undefined,
+      messages: run.messages,
+      onUpdate: (msgs) => {
+        run.messages = msgs;
+        report();
+      },
+    });
+    run.report = textOf(run.messages[run.messages.length - 1]?.content) || "(no report)";
+    run.status = "done";
+  } catch (e) {
+    run.status = o.signal?.aborted ? "stopped" : "failed";
+    run.report = `Subagent ${run.status}: ${e instanceof Error ? e.message : String(e)}`;
+  }
+  report();
+  return `Report from the ${project} agent:\n${run.report}`;
+}
+
+// ---------- The agent loop ----------
 
 export async function runAgent(o: AgentOptions): Promise<ChatCompletionMessageParam[]> {
   const client = new OpenAI({
@@ -89,27 +274,19 @@ export async function runAgent(o: AgentOptions): Promise<ChatCompletionMessagePa
     baseURL: "https://openrouter.ai/api/v1",
     dangerouslyAllowBrowser: true, // fine here: this is your own desktop app
   });
-
-  const system: ChatCompletionMessageParam = {
-    role: "system",
-    content:
-      `You are a coding assistant working in the folder ${o.folder}. ` +
-      "Use the tools to look at files before changing them. All paths are relative to that folder. " +
-      "Be concise.",
-  };
-
+  const tools = o.role === "sub" ? FILE_TOOLS : [...PROJECT_TOOLS, ...FILE_TOOLS];
   const messages = [...o.messages];
 
   for (let step = 0; step < MAX_STEPS; step++) {
-    // 1. Send the conversation and stream the reply.
+    // 1. Send the conversation (with a fresh system prompt) and stream the reply.
+    const system: ChatCompletionMessageParam = { role: "system", content: systemPrompt(o) };
     const stream = await client.chat.completions.create(
-      { model: o.model, messages: [system, ...messages], tools: TOOLS, stream: true },
+      { model: o.model, messages: [system, ...messages], tools, stream: true },
       { signal: o.signal },
     );
 
     let text = "";
     const calls: { id: string; name: string; args: string }[] = [];
-
     for await (const chunk of stream) {
       const delta = chunk.choices[0]?.delta;
       if (!delta) continue;
@@ -117,7 +294,6 @@ export async function runAgent(o: AgentOptions): Promise<ChatCompletionMessagePa
         text += delta.content;
         o.onUpdate(messages, text);
       }
-      // Tool calls arrive in pieces; glue them back together by index.
       for (const tc of delta.tool_calls ?? []) {
         const call = (calls[tc.index] ??= { id: "", name: "", args: "" });
         if (tc.id) call.id = tc.id;
@@ -125,14 +301,13 @@ export async function runAgent(o: AgentOptions): Promise<ChatCompletionMessagePa
         if (tc.function?.arguments) call.args += tc.function.arguments;
       }
     }
-
     const toolCalls = calls.filter(Boolean);
 
     // 2. Save what the model said.
     if (toolCalls.length === 0) {
       messages.push({ role: "assistant", content: text });
       o.onUpdate(messages, "");
-      return messages; // plain answer, no tools: we're done
+      return messages;
     }
     messages.push({
       role: "assistant",
@@ -145,19 +320,22 @@ export async function runAgent(o: AgentOptions): Promise<ChatCompletionMessagePa
     });
     o.onUpdate(messages, "");
 
-    // 3. Run each tool (if allowed) and add its result.
-    for (const call of toolCalls) {
-      let result: string;
-      try {
-        const args = JSON.parse(call.args || "{}");
-        const refusal = await checkPermission(call.name, args, o.getMode(), o.folder, o.ask);
-        result = refusal ?? (await runTool(call.name, args, o.folder));
-      } catch (e) {
-        result = `Error: ${e instanceof Error ? e.message : String(e)}`;
-      }
-      messages.push({ role: "tool", tool_call_id: call.id, content: result });
+    // 3. Run the tools. Ordinary tools run one after another, in order;
+    //    delegate_task calls start immediately and run side by side.
+    const addResult = (id: string, content: string) => {
+      messages.push({ role: "tool", tool_call_id: id, content });
       o.onUpdate(messages, "");
+    };
+    const subagents: Promise<void>[] = [];
+    let slot = 0;
+    for (const call of toolCalls) {
+      if (call.name === "delegate_task") {
+        subagents.push(execute(call, o, slot++).then((r) => addResult(call.id, r)));
+      } else {
+        addResult(call.id, await execute(call, o, 0));
+      }
     }
+    await Promise.all(subagents);
     // 4. Loop: send the results back so the model can continue.
   }
 
