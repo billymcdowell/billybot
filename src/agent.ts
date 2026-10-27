@@ -41,11 +41,24 @@ const FILE_TOOLS = [
   fn("read_file", "Read a text file.", { path }, ["path"]),
   fn(
     "write_file",
-    "Create or overwrite a text file with its full new contents. Read it first when changing it. The project must be open as writable.",
+    "Create a new text file, or replace a file completely, with its full new contents. For a small change to an existing file, use edit_file instead. The project must be open as writable.",
     { path, content: { type: "string" } },
     ["path", "content"],
   ),
+  fn(
+    "edit_file",
+    "Change part of an existing file by replacing one exact snippet. Read the file first and copy old_text exactly, including spaces and line breaks. It must match exactly once, so include enough surrounding lines to be unique. The project must be open as writable.",
+    {
+      path,
+      old_text: { type: "string", description: "The exact text to replace." },
+      new_text: { type: "string", description: "What to put in its place." },
+    },
+    ["path", "old_text", "new_text"],
+  ),
 ];
+
+// Tools that change a file, so the project must be open as writable.
+const WRITING_FILE_TOOLS = ["write_file", "edit_file"];
 
 const PROJECT_TOOLS = [
   fn("list_projects", "List the projects in the workspace with their README summary.", {}, []),
@@ -111,6 +124,7 @@ function systemPrompt(o: AgentOptions): string {
     `Workspace: ${o.workspace}`,
     `Open projects: ${open}`,
     "Every file path starts with a project name, e.g. \"my-app/src/index.ts\".",
+    "To change an existing file, read it and use edit_file for the part that changes; use write_file for new files or complete rewrites.",
     "When a task starts, call list_projects to find the right project and open it. Create a project only if nothing fits.",
     `Open projects read-only unless you need to change them. At most ${MAX_OPEN_PROJECTS} can be open; close ones you no longer need.`,
     "For larger jobs spanning projects, use delegate_task to give each project its own subagent, and include any shared contract in each task.",
@@ -137,7 +151,7 @@ function openProjectFor(tool: string, p: string, o: AgentOptions) {
     const names = o.projects.map((x) => x.name).join(", ") || "none";
     throw new Error(`"${project}" is not open. Paths must start with an open project (open: ${names}).`);
   }
-  if (tool === "write_file" && !open.writable) {
+  if (WRITING_FILE_TOOLS.includes(tool) && !open.writable) {
     throw new Error(`${project} is open read-only. Call open_project with writable: true to change it.`);
   }
   return { project, rest };
@@ -152,7 +166,7 @@ async function execute(
 ): Promise<string> {
   try {
     const args = JSON.parse(call.args || "{}");
-    const isFileTool = ["list_dir", "read_file", "write_file"].includes(call.name);
+    const isFileTool = ["list_dir", "read_file", ...WRITING_FILE_TOOLS].includes(call.name);
     const target = isFileTool ? openProjectFor(call.name, String(args.path ?? ""), o) : null;
 
     // Permission: per project for file tools, per workspace for create_project.
@@ -174,6 +188,13 @@ async function execute(
           workspace: o.workspace,
           ...pp(target),
           content: String(args.content ?? ""),
+        });
+      case "edit_file":
+        return await invoke<string>("edit_file", {
+          workspace: o.workspace,
+          ...pp(target),
+          oldText: String(args.old_text ?? ""),
+          newText: String(args.new_text ?? ""),
         });
       case "list_projects":
         return await listProjects(o);

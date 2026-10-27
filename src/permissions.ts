@@ -8,7 +8,7 @@ export const MODES: { id: Mode; label: string }[] = [
 ];
 
 // Tools that change something. Everything else is always allowed.
-const WRITE_TOOLS = new Set(["write_file", "create_project"]);
+const WRITE_TOOLS = new Set(["write_file", "edit_file", "create_project"]);
 
 export type Approval = "once" | "always" | "deny";
 

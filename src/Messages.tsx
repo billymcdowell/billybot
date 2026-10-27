@@ -43,6 +43,7 @@ const TOOLS: Record<string, { icon: ElementType; done: string; running: string }
   list_dir: { icon: FolderTreeIcon, done: "Listed", running: "Listing" },
   read_file: { icon: FileTextIcon, done: "Read", running: "Reading" },
   write_file: { icon: FilePenIcon, done: "Wrote", running: "Writing" },
+  edit_file: { icon: FilePenIcon, done: "Edited", running: "Editing" },
   list_projects: { icon: ListIcon, done: "Listed projects", running: "Listing projects" },
   open_project: { icon: FolderOpenIcon, done: "Opened", running: "Opening" },
   close_project: { icon: FolderXIcon, done: "Closed", running: "Closing" },

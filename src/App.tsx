@@ -535,7 +535,9 @@ export default function App() {
                   <ItemTitle>
                     {pending.req.tool === "create_project"
                       ? `Create project ${String(pending.req.args.name)}?`
-                      : `Write ${String(pending.req.args.path)}?`}
+                      : pending.req.tool === "edit_file"
+                        ? `Edit ${String(pending.req.args.path)}?`
+                        : `Write ${String(pending.req.args.path)}?`}
                   </ItemTitle>
                   <ItemDescription>
                     {pending.req.who} · {pending.req.where}
@@ -558,6 +560,22 @@ export default function App() {
                     <CodeBlock size="sm">
                       <CodeBlockContent wrap className="max-h-48">
                         {String(pending.req.args.content ?? "")}
+                      </CodeBlockContent>
+                    </CodeBlock>
+                  </ItemFooter>
+                )}
+                {pending.req.tool === "edit_file" && (
+                  <ItemFooter className="flex-col items-stretch gap-2">
+                    <p className="text-xs text-muted-foreground">Replace</p>
+                    <CodeBlock size="sm" variant="destructive">
+                      <CodeBlockContent wrap className="max-h-32">
+                        {String(pending.req.args.old_text ?? "")}
+                      </CodeBlockContent>
+                    </CodeBlock>
+                    <p className="text-xs text-muted-foreground">With</p>
+                    <CodeBlock size="sm">
+                      <CodeBlockContent wrap className="max-h-32">
+                        {String(pending.req.args.new_text ?? "")}
                       </CodeBlockContent>
                     </CodeBlock>
                   </ItemFooter>
