@@ -34,6 +34,7 @@ import {
   TraceTitle,
 } from "@/components/ui/trace";
 import { textOf } from "./agent";
+import Markdown from "./Markdown";
 import type { SubagentRun } from "./storage";
 
 type Msg = ChatCompletionMessageParam;
@@ -145,7 +146,7 @@ function SubagentLine({ run }: { run: SubagentRun }) {
       <TraceCollapsibleContent className="flex flex-col gap-3">
         <p className="text-muted-foreground">{run.task}</p>
         <ToolCalls messages={run.messages} />
-        {run.report && <p className="whitespace-pre-wrap">{run.report}</p>}
+        {run.report && <Markdown>{run.report}</Markdown>}
       </TraceCollapsibleContent>
     </TraceCollapsible>
   );
@@ -185,7 +186,7 @@ export default function MessageList({ messages, streaming, subagents = {} }: Pro
                 <MessageScrollerItem key={i} messageId={String(i)}>
                   <Message>
                     <MessageContent className="gap-2">
-                      {textOf(m.content) && <p className="whitespace-pre-wrap">{textOf(m.content)}</p>}
+                      {textOf(m.content) && <Markdown>{textOf(m.content)}</Markdown>}
                       {calls.length > 0 && (
                         <Trace>
                           {calls.map((c) =>
@@ -206,7 +207,7 @@ export default function MessageList({ messages, streaming, subagents = {} }: Pro
               <MessageScrollerItem messageId="streaming">
                 <Message>
                   <MessageContent>
-                    <p className="whitespace-pre-wrap">{streaming}</p>
+                    <Markdown>{streaming}</Markdown>
                   </MessageContent>
                 </Message>
               </MessageScrollerItem>
