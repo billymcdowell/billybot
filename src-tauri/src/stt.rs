@@ -4,7 +4,7 @@ use tauri::ipc::{InvokeBody, Request};
 use tauri::{AppHandle, Manager, State};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
-/// The Whisper model file. Download it once into the app's models folder (see the guide).
+/// The Whisper model file. Download it once into the app's models folder.
 /// Swap for "ggml-large-v3-turbo-q5_0.bin" for better accuracy.
 const MODEL_FILE: &str = "ggml-base.en.bin";
 
