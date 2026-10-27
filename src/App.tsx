@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
@@ -6,16 +6,21 @@ import {
   AlertCircleIcon,
   ArrowUpIcon,
   ChevronDownIcon,
+  EyeIcon,
   FilePenIcon,
   FolderIcon,
+  FolderPlusIcon,
   MicIcon,
+  PencilIcon,
   PlusIcon,
   RotateCcwIcon,
   SquareIcon,
   Trash2Icon,
+  XIcon,
 } from "lucide-react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { ButtonGroup } from "@/components/ui/button-group";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { CodeBlock, CodeBlockContent } from "@/components/ui/code-block";
 import {
@@ -63,11 +68,11 @@ import {
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { DEFAULT_MODEL, runAgent } from "./agent";
-import { polish, startRecording, transcribe, type Recording } from "./dictation";
-import MessageList, { textOf } from "./Messages";
+import { DEFAULT_MODEL, runAgent, textOf } from "./agent";
 import ModelPicker from "./ModelPicker";
-import { MODES, type Approval } from "./permissions";
+import MessageList from "./Messages";
+import { polish, startRecording, transcribe, type Recording } from "./dictation";
+import { MODES, type Approval, type ApprovalRequest } from "./permissions";
 import {
   clearAlwaysAllowed,
   deleteConversation,
@@ -77,31 +82,50 @@ import {
   setSetting,
   type Conversation,
   type Mode,
+  type OpenProject,
+  type SubagentRun,
 } from "./storage";
 
-type Pending = {
-  tool: string;
-  args: Record<string, unknown>;
-  resolve: (answer: Approval) => void;
-};
+type Pending = { req: ApprovalRequest; resolve: (answer: Approval) => void };
 
 const newId = (): string => crypto.randomUUID();
 const baseName = (p: string) => p.split("/").filter(Boolean).pop() ?? p;
 
+/** A centred card, used for the key and workspace screens. */
+function Setup(props: { title: string; description: string; error: string; children: ReactNode; action: ReactNode }) {
+  return (
+    <div className="flex h-svh items-center justify-center p-6">
+      <Card className="w-full max-w-sm">
+        <CardHeader>
+          <CardTitle>{props.title}</CardTitle>
+          <CardDescription>{props.description}</CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3">
+          {props.children}
+          {props.error && <p className="text-sm text-destructive">{props.error}</p>}
+        </CardContent>
+        <CardFooter>{props.action}</CardFooter>
+      </Card>
+    </div>
+  );
+}
+
 export default function App() {
   const [apiKey, setApiKey] = useState<string | null | undefined>(undefined); // undefined = loading
   const [keyInput, setKeyInput] = useState("");
-  const [folder, setFolder] = useState<string | null>(null);
+  const [workspace, setWorkspace] = useState<string | null | undefined>(undefined);
   const [model, setModel] = useState(DEFAULT_MODEL);
   const [mode, setMode] = useState<Mode>("ask");
   const modeRef = useRef<Mode>("ask");
   const [chats, setChats] = useState<Conversation[]>([]);
   const [chatId, setChatId] = useState(newId);
   const [messages, setMessages] = useState<ChatCompletionMessageParam[]>([]);
+  const [projects, setProjects] = useState<OpenProject[]>([]);
+  const [subagents, setSubagents] = useState<Record<string, SubagentRun>>({});
   const [streaming, setStreaming] = useState("");
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
-  const [pending, setPending] = useState<Pending | null>(null);
+  const [approvals, setApprovals] = useState<Pending[]>([]); // a queue: subagents may ask at once
   const [error, setError] = useState("");
   const abortRef = useRef<AbortController | null>(null);
   const [dictation, setDictation] = useState<"idle" | "recording" | "working">("idle");
@@ -116,22 +140,22 @@ export default function App() {
         setError(String(e));
         setApiKey(null);
       });
-    getSetting<string | null>("folder", null).then(setFolder);
+    getSetting<string | null>("workspace", null).then(setWorkspace);
     getSetting("model", DEFAULT_MODEL).then(setModel);
     getSetting<Mode>("mode", "ask").then(changeMode);
     getSetting("polish", true).then(setPolishOn);
   }, []);
 
-  // Whenever the folder changes, load that folder's saved chats.
+  // Load this workspace's chats.
   useEffect(() => {
-    if (folder) listConversations(folder).then(setChats);
-  }, [folder]);
+    if (workspace) listConversations(workspace).then(setChats);
+  }, [workspace]);
 
   // Hold Option+Space anywhere in the window to dictate; let go to stop.
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
       if (e.code === "Space" && e.altKey) {
-        e.preventDefault(); // stops Option+Space typing a special space
+        e.preventDefault();
         if (!e.repeat) startDictation();
       }
     };
@@ -147,7 +171,7 @@ export default function App() {
   });
 
   function changeMode(m: Mode) {
-    modeRef.current = m; // the running loop reads this, so changes apply immediately
+    modeRef.current = m;
     setMode(m);
     setSetting("mode", m);
   }
@@ -163,51 +187,135 @@ export default function App() {
     }
   }
 
-  async function pickFolder() {
-    const picked = await open({ directory: true });
-    if (typeof picked === "string") {
-      setFolder(picked);
-      setSetting("folder", picked);
+  async function pickWorkspace() {
+    const picked = await open({ directory: true, title: "Choose your workspace folder" });
+    if (typeof picked !== "string") return;
+    try {
+      const ws = await invoke<string>("check_workspace", { path: picked });
+      setWorkspace(ws);
+      setSetting("workspace", ws);
+      setError("");
       newChat();
+    } catch (e) {
+      setError(String(e));
     }
   }
 
   function newChat() {
     setChatId(newId());
     setMessages([]);
+    setProjects([]);
+    setSubagents({});
     setError("");
   }
 
   function openChat(c: Conversation) {
     setChatId(c.id);
     setMessages(c.messages);
+    setProjects(c.projects ?? []);
+    setSubagents(c.subagents ?? {});
     setError("");
   }
 
   async function removeChat(id: string) {
-    if (!folder) return;
-    await deleteConversation(folder, id);
-    setChats(await listConversations(folder));
+    if (!workspace) return;
+    await deleteConversation(workspace, id);
+    setChats(await listConversations(workspace));
     if (id === chatId) newChat();
   }
 
-  // The loop calls this and waits until you click a button on the approval card.
-  function ask(tool: string, args: Record<string, unknown>) {
-    return new Promise<Approval>((resolve) => setPending({ tool, args, resolve }));
+  // You can close a project or flip it between read-only and writable yourself.
+  function toggleWritable(name: string) {
+    setProjects((ps) => ps.map((p) => (p.name === name ? { ...p, writable: !p.writable } : p)));
+  }
+  function closeProject(name: string) {
+    setProjects((ps) => ps.filter((p) => p.name !== name));
+  }
+
+  async function resetAlwaysAllow() {
+    if (!workspace) return;
+    await clearAlwaysAllowed(workspace);
+    for (const p of projects) await clearAlwaysAllowed(`${workspace}/${p.name}`);
+  }
+
+  // Agents call this and wait until you click a button on the approval card.
+  function ask(req: ApprovalRequest) {
+    return new Promise<Approval>((resolve) => setApprovals((q) => [...q, { req, resolve }]));
   }
 
   function answer(a: Approval) {
-    pending?.resolve(a);
-    setPending(null);
+    approvals[0]?.resolve(a);
+    setApprovals((q) => q.slice(1));
   }
 
   function stop() {
     abortRef.current?.abort();
-    answer("deny"); // unblocks the loop if it is waiting on an approval
+    approvals.forEach((p) => p.resolve("deny")); // unblocks anything waiting on you
+    setApprovals([]);
+  }
+
+  async function send() {
+    const text = input.trim();
+    if (!text || !workspace || !apiKey || busy) return;
+    setInput("");
+    setError("");
+    setBusy(true);
+
+    const history: ChatCompletionMessageParam[] = [...messages, { role: "user", content: text }];
+    setMessages(history);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    let latest = history;
+    let latestProjects = projects.map((p) => ({ ...p })); // the loop changes this copy
+    let subs = { ...subagents };
+
+    try {
+      latest = await runAgent({
+        apiKey,
+        model,
+        workspace,
+        projects: latestProjects,
+        onProjectsChange: (p) => {
+          latestProjects = p;
+          setProjects(p);
+        },
+        getMode: () => modeRef.current,
+        messages: history,
+        ask,
+        signal: controller.signal,
+        onUpdate: (msgs, partial) => {
+          latest = msgs;
+          setMessages([...msgs]);
+          setStreaming(partial);
+        },
+        onSubagent: (id, run) => {
+          subs = { ...subs, [id]: run };
+          setSubagents(subs);
+        },
+      });
+    } catch (e) {
+      if (!controller.signal.aborted) setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setStreaming("");
+      setBusy(false);
+      setApprovals([]);
+      setMessages(latest);
+      const first = latest.find((m) => m.role === "user");
+      const title = textOf(first?.content).slice(0, 40) || "New chat";
+      await saveConversation(workspace, {
+        id: chatId,
+        title,
+        updatedAt: Date.now(),
+        messages: latest,
+        projects: latestProjects,
+        subagents: subs,
+      });
+      setChats(await listConversations(workspace));
+    }
   }
 
   function startDictation() {
-    if (!apiKey || !folder || recordingRef.current) return;
+    if (!apiKey || !workspace || recordingRef.current) return;
     setError("");
     const pending = startRecording();
     recordingRef.current = pending;
@@ -238,52 +346,9 @@ export default function App() {
     }
   }
 
-  async function send() {
-    const text = input.trim();
-    if (!text || !folder || !apiKey || busy) return;
-    setInput("");
-    setError("");
-    setBusy(true);
-
-    const history: ChatCompletionMessageParam[] = [...messages, { role: "user", content: text }];
-    setMessages(history);
-    const controller = new AbortController();
-    abortRef.current = controller;
-    let latest = history;
-
-    try {
-      latest = await runAgent({
-        apiKey,
-        model,
-        folder,
-        getMode: () => modeRef.current,
-        messages: history,
-        ask,
-        signal: controller.signal,
-        onUpdate: (msgs, partial) => {
-          latest = msgs;
-          setMessages([...msgs]);
-          setStreaming(partial);
-        },
-      });
-    } catch (e) {
-      if (!controller.signal.aborted) setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setStreaming("");
-      setBusy(false);
-      setPending(null);
-      setMessages(latest);
-      // Save the conversation, titled by its first message.
-      const first = latest.find((m) => m.role === "user");
-      const title = textOf(first?.content).slice(0, 40) || "New chat";
-      await saveConversation(folder, { id: chatId, title, updatedAt: Date.now(), messages: latest });
-      setChats(await listConversations(folder));
-    }
-  }
-
   // ---------- Screens ----------
 
-  if (apiKey === undefined) {
+  if (apiKey === undefined || workspace === undefined) {
     return (
       <div className="flex h-svh items-center justify-center">
         <Spinner />
@@ -293,30 +358,40 @@ export default function App() {
 
   if (apiKey === null) {
     return (
-      <div className="flex h-svh items-center justify-center p-6">
-        <Card className="w-full max-w-sm">
-          <CardHeader>
-            <CardTitle>Add your OpenRouter key</CardTitle>
-            <CardDescription>It's saved in macOS Keychain, never in a file.</CardDescription>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-3">
-            <Input
-              type="password"
-              placeholder="sk-or-…"
-              value={keyInput}
-              onChange={(e) => setKeyInput(e.target.value)}
-            />
-            {error && <p className="text-sm text-destructive">{error}</p>}
-          </CardContent>
-          <CardFooter>
-            <Button className="w-full" onClick={saveKey} disabled={!keyInput.trim()}>
-              Save key
-            </Button>
-          </CardFooter>
-        </Card>
-      </div>
+      <Setup
+        title="Add your OpenRouter key"
+        description="It's saved in macOS Keychain, never in a file."
+        error={error}
+        action={
+          <Button className="w-full" onClick={saveKey} disabled={!keyInput.trim()}>
+            Save key
+          </Button>
+        }
+      >
+        <Input type="password" placeholder="sk-or-…" value={keyInput} onChange={(e) => setKeyInput(e.target.value)} />
+      </Setup>
     );
   }
+
+  if (workspace === null) {
+    return (
+      <Setup
+        title="Choose your workspace"
+        description="Pick the folder that holds your projects, such as ~/Projects. The agent can work in any folder inside it, and nothing outside it."
+        error={error}
+        action={
+          <Button className="w-full" onClick={pickWorkspace}>
+            <FolderIcon />
+            Choose folder…
+          </Button>
+        }
+      >
+        {null}
+      </Setup>
+    );
+  }
+
+  const pending = approvals[0];
 
   return (
     <TooltipProvider>
@@ -325,19 +400,17 @@ export default function App() {
           <SidebarHeader>
             <SidebarMenu>
               <SidebarMenuItem>
-                <SidebarMenuButton onClick={pickFolder} disabled={busy} tooltip={folder ?? undefined}>
+                <SidebarMenuButton onClick={pickWorkspace} disabled={busy} tooltip={workspace}>
                   <FolderIcon />
-                  <span>{folder ? baseName(folder) : "Choose folder…"}</span>
+                  <span>{baseName(workspace)}</span>
                 </SidebarMenuButton>
               </SidebarMenuItem>
-              {folder && (
-                <SidebarMenuItem>
-                  <SidebarMenuButton onClick={newChat} disabled={busy}>
-                    <PlusIcon />
-                    <span>New chat</span>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              )}
+              <SidebarMenuItem>
+                <SidebarMenuButton onClick={newChat} disabled={busy}>
+                  <PlusIcon />
+                  <span>New chat</span>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
             </SidebarMenu>
           </SidebarHeader>
           <SidebarContent>
@@ -347,8 +420,18 @@ export default function App() {
                 <SidebarMenu>
                   {chats.map((c) => (
                     <SidebarMenuItem key={c.id}>
-                      <SidebarMenuButton isActive={c.id === chatId} onClick={() => openChat(c)} disabled={busy}>
-                        <span className="truncate">{c.title}</span>
+                      <SidebarMenuButton
+                        isActive={c.id === chatId}
+                        onClick={() => openChat(c)}
+                        disabled={busy}
+                        className="h-auto flex-col items-start gap-0"
+                      >
+                        <span className="w-full truncate">{c.title}</span>
+                        {c.projects?.length > 0 && (
+                          <span className="w-full truncate text-xs text-muted-foreground">
+                            {c.projects.map((p) => p.name).join(", ")}
+                          </span>
+                        )}
                       </SidebarMenuButton>
                       <SidebarMenuAction showOnHover onClick={() => removeChat(c.id)} disabled={busy}>
                         <Trash2Icon />
@@ -359,25 +442,51 @@ export default function App() {
               </SidebarGroupContent>
             </SidebarGroup>
           </SidebarContent>
-          {folder && (
-            <SidebarFooter>
-              <SidebarMenu>
-                <SidebarMenuItem>
-                  <SidebarMenuButton size="sm" onClick={() => clearAlwaysAllowed(folder)}>
-                    <RotateCcwIcon />
-                    <span>Reset "always allow" here</span>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              </SidebarMenu>
-            </SidebarFooter>
-          )}
+          <SidebarFooter>
+            <SidebarMenu>
+              <SidebarMenuItem>
+                <SidebarMenuButton size="sm" onClick={resetAlwaysAllow}>
+                  <RotateCcwIcon />
+                  <span>Reset "always allow"</span>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+            </SidebarMenu>
+          </SidebarFooter>
         </Sidebar>
 
         <SidebarInset className="flex h-svh flex-col">
           <header className="flex items-center gap-2 border-b px-3 py-2">
             <SidebarTrigger />
             <Separator orientation="vertical" className="h-4" />
-            <span className="flex-1 truncate text-sm font-medium">{folder ? baseName(folder) : "No folder"}</span>
+            {/* Open projects: click to flip read-only/writable, × to close */}
+            <div className="flex flex-1 flex-wrap items-center gap-1.5">
+              {projects.length === 0 && (
+                <span className="text-sm text-muted-foreground">No project open. The agent will pick or create one.</span>
+              )}
+              {projects.map((p) => (
+                <ButtonGroup key={p.name}>
+                  <Button
+                    size="xs"
+                    variant={p.writable ? "default" : "outline"}
+                    onClick={() => toggleWritable(p.name)}
+                    disabled={busy}
+                    title="Switch between read-only and writable"
+                  >
+                    {p.writable ? <PencilIcon /> : <EyeIcon />}
+                    {p.name}
+                  </Button>
+                  <Button
+                    size="icon-xs"
+                    variant="outline"
+                    onClick={() => closeProject(p.name)}
+                    disabled={busy}
+                    aria-label={`Close ${p.name}`}
+                  >
+                    <XIcon />
+                  </Button>
+                </ButtonGroup>
+              ))}
+            </div>
             <div className="flex items-center gap-2">
               <Switch
                 id="polish"
@@ -395,16 +504,14 @@ export default function App() {
             {messages.length === 0 && !streaming ? (
               <Empty className="h-full">
                 <EmptyHeader>
-                  <EmptyTitle>{folder ? "What are we working on?" : "Choose a project folder"}</EmptyTitle>
+                  <EmptyTitle>What are we working on?</EmptyTitle>
                   <EmptyDescription>
-                    {folder
-                      ? "Ask about the files in this folder, or ask for a change."
-                      : "Use the folder button in the sidebar to pick the folder the agent works in."}
+                    Describe a task. The agent finds or creates the right project in {baseName(workspace)}.
                   </EmptyDescription>
                 </EmptyHeader>
               </Empty>
             ) : (
-              <MessageList messages={messages} streaming={streaming} />
+              <MessageList messages={messages} streaming={streaming} subagents={subagents} />
             )}
           </div>
 
@@ -416,38 +523,47 @@ export default function App() {
               </Alert>
             )}
 
-            {/* The Confirmation pattern: approve or deny before a write runs */}
+            {/* The Confirmation pattern: approve or deny before a change runs */}
             {pending && (
               <Item variant="outline" size="sm">
                 <ItemMedia variant="icon">
-                  <FilePenIcon />
+                  {pending.req.tool === "create_project" ? <FolderPlusIcon /> : <FilePenIcon />}
                 </ItemMedia>
                 <ItemContent>
-                  <ItemTitle>Write {String(pending.args.path)}?</ItemTitle>
-                  <ItemDescription>The file is created or overwritten in this folder.</ItemDescription>
+                  <ItemTitle>
+                    {pending.req.tool === "create_project"
+                      ? `Create project ${String(pending.req.args.name)}?`
+                      : `Write ${String(pending.req.args.path)}?`}
+                  </ItemTitle>
+                  <ItemDescription>
+                    {pending.req.who} · {pending.req.where}
+                    {approvals.length > 1 && ` · ${approvals.length - 1} more waiting`}
+                  </ItemDescription>
                 </ItemContent>
                 <ItemActions>
                   <Button size="sm" variant="outline" onClick={() => answer("deny")}>
                     Deny
                   </Button>
                   <Button size="sm" variant="outline" onClick={() => answer("always")}>
-                    Always allow here
+                    {pending.req.where === "workspace" ? "Always allow creating" : `Always in ${pending.req.where}`}
                   </Button>
                   <Button size="sm" onClick={() => answer("once")}>
                     Approve
                   </Button>
                 </ItemActions>
-                <ItemFooter>
-                  <CodeBlock size="sm">
-                    <CodeBlockContent wrap className="max-h-48">
-                      {String(pending.args.content ?? "")}
-                    </CodeBlockContent>
-                  </CodeBlock>
-                </ItemFooter>
+                {pending.req.tool === "write_file" && (
+                  <ItemFooter>
+                    <CodeBlock size="sm">
+                      <CodeBlockContent wrap className="max-h-48">
+                        {String(pending.req.args.content ?? "")}
+                      </CodeBlockContent>
+                    </CodeBlock>
+                  </ItemFooter>
+                )}
               </Item>
             )}
 
-            {/* The Prompt Input pattern */}
+            {/* The Prompt Input pattern, with the Model Selector menus beside the send button */}
             <form
               onSubmit={(e) => {
                 e.preventDefault();
@@ -457,8 +573,7 @@ export default function App() {
               <InputGroup>
                 <InputGroupTextarea
                   value={input}
-                  placeholder={folder ? "Ask something… (Enter to send, hold ⌥ Space to dictate)" : "Choose a folder first"}
-                  disabled={!folder}
+                  placeholder="Ask something… (Enter to send, hold ⌥ Space to dictate)"
                   className="p-3"
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={(e) => {
@@ -500,7 +615,7 @@ export default function App() {
                     variant={dictation === "recording" ? "destructive" : "ghost"}
                     className="ml-auto"
                     onClick={() => (dictation === "recording" ? stopDictation() : startDictation())}
-                    disabled={!folder || dictation === "working"}
+                    disabled={dictation === "working"}
                     aria-label="Dictate (or hold ⌥ Space)"
                   >
                     {dictation === "working" ? <Spinner /> : dictation === "recording" ? <SquareIcon /> : <MicIcon />}
@@ -521,7 +636,7 @@ export default function App() {
                       size="icon-sm"
                       variant="default"
                       className="rounded-full"
-                      disabled={!folder || !input.trim()}
+                      disabled={!input.trim()}
                       aria-label="Send"
                     >
                       <ArrowUpIcon />
