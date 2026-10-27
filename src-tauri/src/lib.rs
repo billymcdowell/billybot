@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 // Where the API key lives in macOS Keychain.
@@ -247,10 +249,14 @@ fn shorten(text: &str) -> String {
     format!("{head}\n[... {} characters omitted ...]\n{tail}", chars.len() - HEAD_CHARS - TAIL_CHARS)
 }
 
+/// One flag per command that is running right now. Stop sets them all, and each command's
+/// wait loop notices and kills its own process group.
+static RUNNING: Mutex<Vec<Arc<AtomicBool>>> = Mutex::new(Vec::new());
+
 /// Runs a command with the project as its starting folder and returns its exit code and
-/// combined output. Nothing is typed into it, and after it finishes (or times out) anything
-/// it left running is killed.
-fn run_shell(root: &Path, command: &str, timeout: Duration) -> Result<String, String> {
+/// combined output. Nothing is typed into it, and after it finishes, times out or is
+/// cancelled (by setting `cancel`) anything it left running is killed.
+fn run_shell(root: &Path, command: &str, timeout: Duration, cancel: &AtomicBool) -> Result<String, String> {
     // One pipe for both stdout and stderr, so the output keeps its real order.
     let (mut reader, writer) = std::io::pipe().map_err(|e| e.to_string())?;
     let mut cmd = Command::new(SHELL);
@@ -285,11 +291,16 @@ fn run_shell(root: &Path, command: &str, timeout: Duration) -> Result<String, St
     let pid = child.id() as i32;
     let start = Instant::now();
     let mut timed_out = false;
+    let mut cancelled = false;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {}
             Err(e) => return Err(e.to_string()),
+        }
+        if cancel.load(Ordering::SeqCst) {
+            cancelled = true;
+            break None;
         }
         if start.elapsed() >= timeout {
             timed_out = true;
@@ -306,7 +317,9 @@ fn run_shell(root: &Path, command: &str, timeout: Duration) -> Result<String, St
     let _ = child.wait();
     let (bytes, capped) = collector.join().map_err(|_| "Couldn't read the command's output")?;
 
-    let header = if timed_out {
+    let header = if cancelled {
+        "Cancelled: the user pressed Stop, so the command was killed. Output so far:".to_string()
+    } else if timed_out {
         format!("Timed out after {}s and was killed.", timeout.as_secs())
     } else {
         match status.and_then(|s| s.code()) {
@@ -331,10 +344,30 @@ async fn run_command(
     }
     let root = project_root(&workspace, &project)?;
     let secs = timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECS).clamp(1, MAX_TIMEOUT_SECS);
+    // Register a cancel flag so Stop can reach this command while it runs.
+    let cancel = Arc::new(AtomicBool::new(false));
+    RUNNING.lock().map_err(|_| "Lock failed")?.push(cancel.clone());
+    let flag = cancel.clone();
     // Commands take a while, so run off the main thread.
-    tauri::async_runtime::spawn_blocking(move || run_shell(&root, &command, Duration::from_secs(secs)))
-        .await
-        .map_err(|e| e.to_string())?
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        run_shell(&root, &command, Duration::from_secs(secs), &flag)
+    })
+    .await
+    .map_err(|e| e.to_string());
+    if let Ok(mut running) = RUNNING.lock() {
+        running.retain(|f| !Arc::ptr_eq(f, &cancel));
+    }
+    result?
+}
+
+/// Called by the Stop button: cancels every command that is running. Returns how many.
+#[tauri::command]
+fn cancel_commands() -> usize {
+    let running = RUNNING.lock().map(|r| r.clone()).unwrap_or_default();
+    for flag in &running {
+        flag.store(true, Ordering::SeqCst);
+    }
+    running.len()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -356,6 +389,7 @@ pub fn run() {
             write_file,
             edit_file,
             run_command,
+            cancel_commands,
             stt::transcribe_local,
         ])
         .run(tauri::generate_context!())
@@ -424,7 +458,33 @@ mod tests {
 
     fn run(ws: &str, command: &str, secs: u64) -> String {
         let root = project_root(ws, "proj").unwrap();
-        run_shell(&root, command, Duration::from_secs(secs)).unwrap()
+        run_shell(&root, command, Duration::from_secs(secs), &AtomicBool::new(false)).unwrap()
+    }
+
+    #[test]
+    fn command_can_be_cancelled() {
+        let ws = workspace("cmd-cancel");
+        let root = project_root(&ws, "proj").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let start = Instant::now();
+        let job = std::thread::spawn(move || run_shell(&root, "echo before; sleep 30", Duration::from_secs(60), &flag));
+        std::thread::sleep(Duration::from_secs(2)); // the login shell takes ~0.5s to start
+        cancel.store(true, Ordering::SeqCst);
+        let out = job.join().unwrap().unwrap();
+        assert!(out.starts_with("Cancelled"), "{out}");
+        assert!(out.contains("before"), "output so far is kept: {out}");
+        assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn cancelling_one_command_leaves_others_alone() {
+        let ws = workspace("cmd-isolated");
+        let root = project_root(&ws, "proj").unwrap();
+        let cancelled = AtomicBool::new(true);
+        let untouched = AtomicBool::new(false);
+        assert!(run_shell(&root, "sleep 30", Duration::from_secs(60), &cancelled).unwrap().starts_with("Cancelled"));
+        assert!(run_shell(&root, "echo fine", Duration::from_secs(10), &untouched).unwrap().starts_with("Exit code 0"));
     }
 
     #[test]
