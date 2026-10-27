@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
@@ -69,9 +69,12 @@ import {
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { DEFAULT_MODEL, runAgent, textOf } from "./agent";
+import { DEFAULT_MODEL, runAgent, systemPrompt, textOf, toolsFor } from "./agent";
+import ContextMeter from "./ContextMeter";
+import { contextBreakdown } from "./context";
 import DiffView from "./DiffView";
 import ModelPicker from "./ModelPicker";
+import { fetchToolModels } from "./models";
 import MessageList from "./Messages";
 import { polish, startRecording, transcribe, type Recording } from "./dictation";
 import { MODES, type Approval, type ApprovalRequest } from "./permissions";
@@ -133,6 +136,33 @@ export default function App() {
   const [dictation, setDictation] = useState<"idle" | "recording" | "working">("idle");
   const [polishOn, setPolishOn] = useState(true);
   const recordingRef = useRef<Promise<Recording> | null>(null);
+  const [contextWindow, setContextWindow] = useState<number | null>(null);
+  const [lastUsage, setLastUsage] = useState<{ promptTokens: number; completionTokens: number } | null>(null);
+
+  // The selected model's context size comes from OpenRouter's model list (fetched once and cached).
+  useEffect(() => {
+    if (!apiKey) return;
+    let current = true;
+    fetchToolModels(apiKey)
+      .then((list) => current && setContextWindow(list.find((m) => m.id === model)?.contextLength ?? null))
+      .catch(() => current && setContextWindow(null));
+    return () => {
+      current = false;
+    };
+  }, [apiKey, model]);
+
+  // What fills the context: estimated from the conversation, system prompt and tool definitions.
+  const breakdown = useMemo(
+    () =>
+      contextBreakdown({
+        systemText: systemPrompt({ role: "main", projects, workspace: workspace ?? "" }),
+        toolsText: JSON.stringify(toolsFor("main")),
+        messages,
+        streaming,
+        window: contextWindow,
+      }),
+    [projects, workspace, messages, streaming, contextWindow],
+  );
 
   // On startup: read the key from Keychain and restore settings.
   useEffect(() => {
@@ -210,6 +240,7 @@ export default function App() {
     setMessages([]);
     setProjects([]);
     setSubagents({});
+    setLastUsage(null);
     setError("");
   }
 
@@ -218,6 +249,7 @@ export default function App() {
     setMessages(c.messages);
     setProjects(c.projects ?? []);
     setSubagents(c.subagents ?? {});
+    setLastUsage(null);
     setError("");
   }
 
@@ -297,6 +329,7 @@ export default function App() {
           subs = { ...subs, [id]: run };
           setSubagents(subs);
         },
+        onUsage: setLastUsage,
       });
     } catch (e) {
       if (!controller.signal.aborted) setError(e instanceof Error ? e.message : String(e));
@@ -649,6 +682,7 @@ export default function App() {
                       setSetting("model", id);
                     }}
                   />
+                  <ContextMeter breakdown={breakdown} lastRequest={lastUsage} />
                   <InputGroupButton
                     size="icon-sm"
                     variant={dictation === "recording" ? "destructive" : "ghost"}

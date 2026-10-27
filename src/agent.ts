@@ -103,6 +103,11 @@ const SHELL_TOOLS = [
   ),
 ];
 
+/** The tool definitions an agent sends with every request. Subagents only get the file tools. */
+export function toolsFor(role?: "main" | "sub") {
+  return role === "sub" ? FILE_TOOLS : [...PROJECT_TOOLS, ...SHELL_TOOLS, ...FILE_TOOLS];
+}
+
 // ---------- Options ----------
 
 export type AgentOptions = {
@@ -116,12 +121,14 @@ export type AgentOptions = {
   ask: AskFn;
   onUpdate: (messages: ChatCompletionMessageParam[], streamingText: string) => void;
   onSubagent?: (callId: string, run: SubagentRun) => void; // progress of subagents
+  // Token counts the API reports for each request (main agent only).
+  onUsage?: (usage: { promptTokens: number; completionTokens: number }) => void;
   signal?: AbortSignal;
   role?: "main" | "sub";
   who?: string; // shown on approval cards
 };
 
-function systemPrompt(o: AgentOptions): string {
+export function systemPrompt(o: Pick<AgentOptions, "role" | "projects" | "workspace">): string {
   const open = o.projects.length
     ? o.projects.map((p) => `${p.name} (${p.writable ? "writable" : "read-only"})`).join(", ")
     : "none";
@@ -318,6 +325,7 @@ async function runSubagent(callId: string, project: string, task: string, o: Age
       projects: [{ name: project, writable: true }],
       onProjectsChange: undefined,
       onSubagent: undefined,
+      onUsage: undefined, // the meter tracks the main conversation, not each subagent's
       messages: run.messages,
       onUpdate: (msgs) => {
         run.messages = msgs;
@@ -342,7 +350,7 @@ export async function runAgent(o: AgentOptions): Promise<ChatCompletionMessagePa
     baseURL: "https://openrouter.ai/api/v1",
     dangerouslyAllowBrowser: true, // fine here: this is your own desktop app
   });
-  const tools = o.role === "sub" ? FILE_TOOLS : [...PROJECT_TOOLS, ...SHELL_TOOLS, ...FILE_TOOLS];
+  const tools = toolsFor(o.role);
   const messages = [...o.messages];
 
   for (let step = 0; step < MAX_STEPS; step++) {
@@ -356,6 +364,10 @@ export async function runAgent(o: AgentOptions): Promise<ChatCompletionMessagePa
     let text = "";
     const calls: { id: string; name: string; args: string }[] = [];
     for await (const chunk of stream) {
+      // OpenRouter reports token usage on the last chunk of a streamed reply.
+      if (chunk.usage) {
+        o.onUsage?.({ promptTokens: chunk.usage.prompt_tokens, completionTokens: chunk.usage.completion_tokens });
+      }
       const delta = chunk.choices[0]?.delta;
       if (!delta) continue;
       if (delta.content) {
