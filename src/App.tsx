@@ -8,6 +8,7 @@ import {
   ChevronDownIcon,
   FilePenIcon,
   FolderIcon,
+  MicIcon,
   PlusIcon,
   RotateCcwIcon,
   SquareIcon,
@@ -41,6 +42,7 @@ import {
   ItemMedia,
   ItemTitle,
 } from "@/components/ui/item";
+import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import {
   Sidebar,
@@ -59,8 +61,10 @@ import {
   SidebarTrigger,
 } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
+import { Switch } from "@/components/ui/switch";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { DEFAULT_MODEL, runAgent } from "./agent";
+import { polish, startRecording, transcribe, type Recording } from "./dictation";
 import MessageList, { textOf } from "./Messages";
 import ModelPicker from "./ModelPicker";
 import { MODES, type Approval } from "./permissions";
@@ -100,6 +104,9 @@ export default function App() {
   const [pending, setPending] = useState<Pending | null>(null);
   const [error, setError] = useState("");
   const abortRef = useRef<AbortController | null>(null);
+  const [dictation, setDictation] = useState<"idle" | "recording" | "working">("idle");
+  const [polishOn, setPolishOn] = useState(true);
+  const recordingRef = useRef<Promise<Recording> | null>(null);
 
   // On startup: read the key from Keychain and restore settings.
   useEffect(() => {
@@ -112,12 +119,32 @@ export default function App() {
     getSetting<string | null>("folder", null).then(setFolder);
     getSetting("model", DEFAULT_MODEL).then(setModel);
     getSetting<Mode>("mode", "ask").then(changeMode);
+    getSetting("polish", true).then(setPolishOn);
   }, []);
 
   // Whenever the folder changes, load that folder's saved chats.
   useEffect(() => {
     if (folder) listConversations(folder).then(setChats);
   }, [folder]);
+
+  // Hold Option+Space anywhere in the window to dictate; let go to stop.
+  useEffect(() => {
+    const down = (e: KeyboardEvent) => {
+      if (e.code === "Space" && e.altKey) {
+        e.preventDefault(); // stops Option+Space typing a special space
+        if (!e.repeat) startDictation();
+      }
+    };
+    const up = (e: KeyboardEvent) => {
+      if (e.code === "Space" || e.key === "Alt") stopDictation();
+    };
+    window.addEventListener("keydown", down);
+    window.addEventListener("keyup", up);
+    return () => {
+      window.removeEventListener("keydown", down);
+      window.removeEventListener("keyup", up);
+    };
+  });
 
   function changeMode(m: Mode) {
     modeRef.current = m; // the running loop reads this, so changes apply immediately
@@ -177,6 +204,38 @@ export default function App() {
   function stop() {
     abortRef.current?.abort();
     answer("deny"); // unblocks the loop if it is waiting on an approval
+  }
+
+  function startDictation() {
+    if (!apiKey || !folder || recordingRef.current) return;
+    setError("");
+    const pending = startRecording();
+    recordingRef.current = pending;
+    setDictation("recording");
+    pending.catch((e) => {
+      recordingRef.current = null;
+      setDictation("idle");
+      setError(`Microphone: ${e instanceof Error ? e.message : String(e)}`);
+    });
+  }
+
+  async function stopDictation() {
+    const pending = recordingRef.current;
+    if (!pending || !apiKey) return;
+    recordingRef.current = null;
+    setDictation("working");
+    try {
+      const recording = await pending;
+      const audio = await recording.stop();
+      if (Date.now() - recording.startedAt < 400) return; // a quick tap, not speech
+      let text = await transcribe(apiKey, audio);
+      if (text && polishOn) text = await polish(apiKey, text).catch(() => text);
+      if (text) setInput((prev) => (prev.trim() ? prev.trimEnd() + " " : "") + text);
+    } catch (e) {
+      setError(`Dictation: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setDictation("idle");
+    }
   }
 
   async function send() {
@@ -319,6 +378,17 @@ export default function App() {
             <SidebarTrigger />
             <Separator orientation="vertical" className="h-4" />
             <span className="flex-1 truncate text-sm font-medium">{folder ? baseName(folder) : "No folder"}</span>
+            <div className="flex items-center gap-2">
+              <Switch
+                id="polish"
+                checked={polishOn}
+                onCheckedChange={(on) => {
+                  setPolishOn(on);
+                  setSetting("polish", on);
+                }}
+              />
+              <Label htmlFor="polish">Polish dictation</Label>
+            </div>
           </header>
 
           <div className="min-h-0 flex-1">
@@ -387,7 +457,7 @@ export default function App() {
               <InputGroup>
                 <InputGroupTextarea
                   value={input}
-                  placeholder={folder ? "Ask something… (Enter to send)" : "Choose a folder first"}
+                  placeholder={folder ? "Ask something… (Enter to send, hold ⌥ Space to dictate)" : "Choose a folder first"}
                   disabled={!folder}
                   className="p-3"
                   onChange={(e) => setInput(e.target.value)}
@@ -425,11 +495,21 @@ export default function App() {
                       setSetting("model", id);
                     }}
                   />
+                  <InputGroupButton
+                    size="icon-sm"
+                    variant={dictation === "recording" ? "destructive" : "ghost"}
+                    className="ml-auto"
+                    onClick={() => (dictation === "recording" ? stopDictation() : startDictation())}
+                    disabled={!folder || dictation === "working"}
+                    aria-label="Dictate (or hold ⌥ Space)"
+                  >
+                    {dictation === "working" ? <Spinner /> : dictation === "recording" ? <SquareIcon /> : <MicIcon />}
+                  </InputGroupButton>
                   {busy ? (
                     <InputGroupButton
                       size="icon-sm"
                       variant="default"
-                      className="ml-auto rounded-full"
+                      className="rounded-full"
                       onClick={stop}
                       aria-label="Stop"
                     >
@@ -440,7 +520,7 @@ export default function App() {
                       type="submit"
                       size="icon-sm"
                       variant="default"
-                      className="ml-auto rounded-full"
+                      className="rounded-full"
                       disabled={!folder || !input.trim()}
                       aria-label="Send"
                     >
