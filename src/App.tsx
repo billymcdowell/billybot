@@ -62,6 +62,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { DEFAULT_MODEL, runAgent } from "./agent";
 import MessageList, { textOf } from "./Messages";
+import ModelPicker from "./ModelPicker";
 import { MODES, type Approval } from "./permissions";
 import {
   clearAlwaysAllowed,
@@ -415,6 +416,15 @@ export default function App() {
                       </DropdownMenuRadioGroup>
                     </DropdownMenuContent>
                   </DropdownMenu>
+                  <ModelPicker
+                    apiKey={apiKey}
+                    value={model}
+                    disabled={busy}
+                    onChange={(id) => {
+                      setModel(id);
+                      setSetting("model", id);
+                    }}
+                  />
                   {busy ? (
                     <InputGroupButton
                       size="icon-sm"
