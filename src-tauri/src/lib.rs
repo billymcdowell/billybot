@@ -2,7 +2,10 @@ mod stt;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::io::Read;
+use std::os::unix::process::CommandExt;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 // Where the API key lives in macOS Keychain.
 const SERVICE: &str = "billybot";
@@ -220,6 +223,120 @@ fn edit_file(
     }
 }
 
+// ---------- Running commands ----------
+//
+// Unlike the file tools, this is NOT locked to the project folder: a shell command can
+// reach anything your user account can. The project is only where it starts. The
+// protection is the approval prompt in the app, so keep that in place.
+
+const SHELL: &str = "/bin/zsh";
+const DEFAULT_TIMEOUT_SECS: u64 = 60;
+const MAX_TIMEOUT_SECS: u64 = 300;
+const READ_LIMIT: usize = 1_000_000; // bytes kept while a command runs; the rest is thrown away
+const HEAD_CHARS: usize = 10_000;
+const TAIL_CHARS: usize = 20_000;
+
+/// Keeps the start and the end of long output, which is where errors usually are.
+fn shorten(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= HEAD_CHARS + TAIL_CHARS {
+        return text.to_string();
+    }
+    let head: String = chars[..HEAD_CHARS].iter().collect();
+    let tail: String = chars[chars.len() - TAIL_CHARS..].iter().collect();
+    format!("{head}\n[... {} characters omitted ...]\n{tail}", chars.len() - HEAD_CHARS - TAIL_CHARS)
+}
+
+/// Runs a command with the project as its starting folder and returns its exit code and
+/// combined output. Nothing is typed into it, and after it finishes (or times out) anything
+/// it left running is killed.
+fn run_shell(root: &Path, command: &str, timeout: Duration) -> Result<String, String> {
+    // One pipe for both stdout and stderr, so the output keeps its real order.
+    let (mut reader, writer) = std::io::pipe().map_err(|e| e.to_string())?;
+    let mut cmd = Command::new(SHELL);
+    cmd.args(["-l", "-c", command])
+        .current_dir(root)
+        .env("NO_COLOR", "1")
+        .env("TERM", "dumb")
+        .stdin(Stdio::null())
+        .stdout(writer.try_clone().map_err(|e| e.to_string())?)
+        .stderr(writer)
+        .process_group(0); // its own group, so we can stop everything it starts
+    let mut child = cmd.spawn().map_err(|e| format!("Couldn't start the shell: {e}"))?;
+    drop(cmd); // closes our copies of the pipe's write end, so reading stops when the command does
+
+    let collector = std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut capped = false;
+        let mut chunk = [0u8; 8192];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let room = READ_LIMIT.saturating_sub(kept.len());
+                    kept.extend_from_slice(&chunk[..n.min(room)]);
+                    capped |= n > room; // keep draining so the command never blocks on a full pipe
+                }
+            }
+        }
+        (kept, capped)
+    });
+
+    let pid = child.id() as i32;
+    let start = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        if start.elapsed() >= timeout {
+            timed_out = true;
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    // Kill whatever is left in the command's group: everything on a timeout, or stray
+    // background jobs after a normal exit. Without this, a leftover process would keep
+    // the output pipe open and we would wait on it forever.
+    unsafe {
+        libc::killpg(pid, libc::SIGKILL);
+    }
+    let _ = child.wait();
+    let (bytes, capped) = collector.join().map_err(|_| "Couldn't read the command's output")?;
+
+    let header = if timed_out {
+        format!("Timed out after {}s and was killed.", timeout.as_secs())
+    } else {
+        match status.and_then(|s| s.code()) {
+            Some(code) => format!("Exit code {code}"),
+            None => "Exit code unknown (stopped by a signal)".to_string(),
+        }
+    };
+    let output = shorten(String::from_utf8_lossy(&bytes).trim_end());
+    let note = if capped { "\n[output cut off after 1 MB]" } else { "" };
+    Ok(format!("{header}\n{}{note}", if output.is_empty() { "(no output)" } else { &output }))
+}
+
+#[tauri::command]
+async fn run_command(
+    workspace: String,
+    project: String,
+    command: String,
+    timeout_seconds: Option<u64>,
+) -> Result<String, String> {
+    if command.trim().is_empty() {
+        return Err("command must not be empty".into());
+    }
+    let root = project_root(&workspace, &project)?;
+    let secs = timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECS).clamp(1, MAX_TIMEOUT_SECS);
+    // Commands take a while, so run off the main thread.
+    tauri::async_runtime::spawn_blocking(move || run_shell(&root, &command, Duration::from_secs(secs)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -238,6 +355,7 @@ pub fn run() {
             read_file,
             write_file,
             edit_file,
+            run_command,
             stt::transcribe_local,
         ])
         .run(tauri::generate_context!())
@@ -302,5 +420,77 @@ mod tests {
         fs::write(&outside, "secret").unwrap();
         assert!(edit(&ws, "../other/b.txt", "secret", "hacked").is_err());
         assert_eq!(fs::read_to_string(&outside).unwrap(), "secret");
+    }
+
+    fn run(ws: &str, command: &str, secs: u64) -> String {
+        let root = project_root(ws, "proj").unwrap();
+        run_shell(&root, command, Duration::from_secs(secs)).unwrap()
+    }
+
+    #[test]
+    fn command_reports_output_and_exit_code() {
+        let ws = workspace("cmd-ok");
+        let out = run(&ws, "echo hello", 10);
+        assert!(out.starts_with("Exit code 0"), "{out}");
+        assert!(out.contains("hello"));
+    }
+
+    #[test]
+    fn command_reports_failure_and_stderr() {
+        let ws = workspace("cmd-fail");
+        let out = run(&ws, "echo oops 1>&2; exit 3", 10);
+        assert!(out.starts_with("Exit code 3"), "{out}");
+        assert!(out.contains("oops"));
+    }
+
+    #[test]
+    fn command_starts_in_the_project_folder() {
+        let ws = workspace("cmd-cwd");
+        let expected = project_root(&ws, "proj").unwrap();
+        let out = run(&ws, "pwd", 10);
+        assert!(out.contains(expected.to_str().unwrap()), "{out}");
+    }
+
+    #[test]
+    fn command_times_out_and_is_killed() {
+        let ws = workspace("cmd-timeout");
+        let start = Instant::now();
+        let out = run(&ws, "sleep 30", 1);
+        assert!(out.starts_with("Timed out after 1s"), "{out}");
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn command_cannot_leave_a_background_job_running() {
+        let ws = workspace("cmd-bg");
+        let start = Instant::now();
+        let out = run(&ws, "sleep 30 & echo started", 10);
+        assert!(out.contains("started"), "{out}");
+        // Without the group kill we would sit here until the background sleep ended.
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn command_gets_no_input() {
+        let ws = workspace("cmd-stdin");
+        let start = Instant::now();
+        let out = run(&ws, "cat", 10); // would wait forever for input if stdin were open
+        assert!(out.starts_with("Exit code 0"), "{out}");
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn command_output_is_shortened() {
+        let ws = workspace("cmd-long");
+        let out = run(&ws, "head -c 100000 /dev/zero | tr '\\0' a", 20);
+        assert!(out.contains("characters omitted"), "{}", &out[..80.min(out.len())]);
+        assert!(out.len() < 35_000);
+    }
+
+    #[test]
+    fn command_needs_a_real_project() {
+        let ws = workspace("cmd-noproject");
+        assert!(project_root(&ws, "../etc").is_err());
+        assert!(project_root(&ws, "missing").is_err());
     }
 }
