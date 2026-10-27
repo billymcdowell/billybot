@@ -22,7 +22,6 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { ButtonGroup } from "@/components/ui/button-group";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
-import { CodeBlock, CodeBlockContent } from "@/components/ui/code-block";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -69,6 +68,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { DEFAULT_MODEL, runAgent, textOf } from "./agent";
+import DiffView from "./DiffView";
 import ModelPicker from "./ModelPicker";
 import MessageList from "./Messages";
 import { polish, startRecording, transcribe, type Recording } from "./dictation";
@@ -557,27 +557,19 @@ export default function App() {
                 </ItemActions>
                 {pending.req.tool === "write_file" && (
                   <ItemFooter>
-                    <CodeBlock size="sm">
-                      <CodeBlockContent wrap className="max-h-48">
-                        {String(pending.req.args.content ?? "")}
-                      </CodeBlockContent>
-                    </CodeBlock>
+                    <DiffView
+                      before={pending.req.before ?? ""}
+                      after={String(pending.req.args.content ?? "")}
+                      isNew={pending.req.before === null}
+                    />
                   </ItemFooter>
                 )}
                 {pending.req.tool === "edit_file" && (
-                  <ItemFooter className="flex-col items-stretch gap-2">
-                    <p className="text-xs text-muted-foreground">Replace</p>
-                    <CodeBlock size="sm" variant="destructive">
-                      <CodeBlockContent wrap className="max-h-32">
-                        {String(pending.req.args.old_text ?? "")}
-                      </CodeBlockContent>
-                    </CodeBlock>
-                    <p className="text-xs text-muted-foreground">With</p>
-                    <CodeBlock size="sm">
-                      <CodeBlockContent wrap className="max-h-32">
-                        {String(pending.req.args.new_text ?? "")}
-                      </CodeBlockContent>
-                    </CodeBlock>
+                  <ItemFooter>
+                    <DiffView
+                      before={String(pending.req.args.old_text ?? "")}
+                      after={String(pending.req.args.new_text ?? "")}
+                    />
                   </ItemFooter>
                 )}
               </Item>

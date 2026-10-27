@@ -173,7 +173,12 @@ async function execute(
     const where = target ? target.project : "workspace";
     const scope = target ? `${o.workspace}/${target.project}` : o.workspace;
     const who = o.who ?? "Main agent";
-    const refusal = await checkPermission({ tool: call.name, args, who, where }, o.getMode(), scope, o.ask);
+    // For a full rewrite, fetch the current text so the approval card can show what changes.
+    const before =
+      call.name === "write_file" && target
+        ? await invoke<string>("read_file", { workspace: o.workspace, ...pp(target) }).catch(() => null)
+        : undefined;
+    const refusal = await checkPermission({ tool: call.name, args, who, where, before }, o.getMode(), scope, o.ask);
     if (refusal) return refusal;
 
     switch (call.name) {

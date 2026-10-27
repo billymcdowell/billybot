@@ -18,6 +18,7 @@ export type ApprovalRequest = {
   args: Record<string, unknown>;
   who: string; // "Main agent" or "bakery-api agent"
   where: string; // the project name, or "workspace" for create_project
+  before?: string | null; // write_file: the file's current text, or null if it doesn't exist yet
 };
 export type AskFn = (req: ApprovalRequest) => Promise<Approval>;
 
