@@ -9,6 +9,7 @@ import {
   FolderTreeIcon,
   FolderXIcon,
   ListIcon,
+  TerminalIcon,
   WrenchIcon,
 } from "lucide-react";
 import { Bubble, BubbleContent } from "@/components/ui/bubble";
@@ -44,6 +45,7 @@ const TOOLS: Record<string, { icon: ElementType; done: string; running: string }
   read_file: { icon: FileTextIcon, done: "Read", running: "Reading" },
   write_file: { icon: FilePenIcon, done: "Wrote", running: "Writing" },
   edit_file: { icon: FilePenIcon, done: "Edited", running: "Editing" },
+  run_command: { icon: TerminalIcon, done: "Ran", running: "Running" },
   list_projects: { icon: ListIcon, done: "Listed projects", running: "Listing projects" },
   open_project: { icon: FolderOpenIcon, done: "Opened", running: "Opening" },
   close_project: { icon: FolderXIcon, done: "Closed", running: "Closing" },
@@ -52,7 +54,7 @@ const TOOLS: Record<string, { icon: ElementType; done: string; running: string }
 
 // Results the agent writes when a tool didn't do what was asked.
 const isFailure = (result: string) =>
-  /^(Error:|Refused:|Could not|Read-only mode|The user denied)/.test(result);
+  /^(Error:|Refused:|Could not|Read-only mode|The user denied|Timed out|Exit code (?!0\b))/.test(result);
 
 function callsOf(m: Msg): Call[] {
   if (m.role !== "assistant" || !m.tool_calls) return [];
@@ -79,7 +81,7 @@ function resultsOf(messages: Msg[]) {
 function ToolLine({ call, result }: { call: Call; result?: string }) {
   const tool = TOOLS[call.name] ?? { icon: WrenchIcon, done: `Ran ${call.name}`, running: `Running ${call.name}` };
   const Icon = tool.icon;
-  const target = String(call.args.path ?? call.args.name ?? "");
+  const target = String(call.args.path ?? call.args.name ?? call.args.command ?? "");
   const failed = result !== undefined && isFailure(result);
   const title =
     result === undefined ? `${tool.running} ${target}…` : `${failed ? "Failed: " : ""}${tool.done} ${target}`;

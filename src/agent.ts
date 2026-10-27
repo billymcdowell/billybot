@@ -89,6 +89,20 @@ const PROJECT_TOOLS = [
   ),
 ];
 
+// Only the main agent gets this, not subagents.
+const SHELL_TOOLS = [
+  fn(
+    "run_command",
+    "Run a shell command (tests, a build, installing packages, git) in the folder of an open, writable project. The user must approve every command, so keep each one short and purposeful. It cannot ask questions or take input, and it is stopped after the time limit. Do not use it to read or write files: use the file tools for that.",
+    {
+      project: { type: "string", description: "The open, writable project to run the command in." },
+      command: { type: "string" },
+      timeout_seconds: { type: "number", description: "Optional time limit. Default 60, at most 300." },
+    },
+    ["project", "command"],
+  ),
+];
+
 // ---------- Options ----------
 
 export type AgentOptions = {
@@ -125,6 +139,7 @@ function systemPrompt(o: AgentOptions): string {
     `Open projects: ${open}`,
     "Every file path starts with a project name, e.g. \"my-app/src/index.ts\".",
     "To change an existing file, read it and use edit_file for the part that changes; use write_file for new files or complete rewrites.",
+    "Use run_command for things only a shell can do, such as running tests or a build. The user approves every command, so don't run commands you don't need, and never run anything destructive or that reaches outside the project unless the user asked for it.",
     "When a task starts, call list_projects to find the right project and open it. Create a project only if nothing fits.",
     `Open projects read-only unless you need to change them. At most ${MAX_OPEN_PROJECTS} can be open; close ones you no longer need.`,
     "For larger jobs spanning projects, use delegate_task to give each project its own subagent, and include any shared contract in each task.",
@@ -157,6 +172,20 @@ function openProjectFor(tool: string, p: string, o: AgentOptions) {
   return { project, rest };
 }
 
+/** A command can change anything in its project, so the project must be open and writable. */
+function openProjectForCommand(project: string, o: AgentOptions) {
+  if (o.role === "sub") throw new Error("Subagents cannot run commands.");
+  const open = o.projects.find((x) => x.name === project);
+  if (!open) {
+    const names = o.projects.map((x) => x.name).join(", ") || "none";
+    throw new Error(`"${project}" is not open. Open it first (open: ${names}).`);
+  }
+  if (!open.writable) {
+    throw new Error(`${project} is open read-only. Call open_project with writable: true to run commands in it.`);
+  }
+  return project;
+}
+
 // ---------- Running one tool call ----------
 
 async function execute(
@@ -169,9 +198,12 @@ async function execute(
     const isFileTool = ["list_dir", "read_file", ...WRITING_FILE_TOOLS].includes(call.name);
     const target = isFileTool ? openProjectFor(call.name, String(args.path ?? ""), o) : null;
 
-    // Permission: per project for file tools, per workspace for create_project.
-    const where = target ? target.project : "workspace";
-    const scope = target ? `${o.workspace}/${target.project}` : o.workspace;
+    const commandProject = call.name === "run_command" ? openProjectForCommand(String(args.project ?? ""), o) : null;
+
+    // Permission: per project for file tools and commands, per workspace for create_project.
+    const project = target?.project ?? commandProject;
+    const where = project ?? "workspace";
+    const scope = project ? `${o.workspace}/${project}` : o.workspace;
     const who = o.who ?? "Main agent";
     // For a full rewrite, fetch the current text so the approval card can show what changes.
     const before =
@@ -200,6 +232,13 @@ async function execute(
           ...pp(target),
           oldText: String(args.old_text ?? ""),
           newText: String(args.new_text ?? ""),
+        });
+      case "run_command":
+        return await invoke<string>("run_command", {
+          workspace: o.workspace,
+          project: commandProject,
+          command: String(args.command ?? ""),
+          timeoutSeconds: typeof args.timeout_seconds === "number" ? args.timeout_seconds : undefined,
         });
       case "list_projects":
         return await listProjects(o);
@@ -300,7 +339,7 @@ export async function runAgent(o: AgentOptions): Promise<ChatCompletionMessagePa
     baseURL: "https://openrouter.ai/api/v1",
     dangerouslyAllowBrowser: true, // fine here: this is your own desktop app
   });
-  const tools = o.role === "sub" ? FILE_TOOLS : [...PROJECT_TOOLS, ...FILE_TOOLS];
+  const tools = o.role === "sub" ? FILE_TOOLS : [...PROJECT_TOOLS, ...SHELL_TOOLS, ...FILE_TOOLS];
   const messages = [...o.messages];
 
   for (let step = 0; step < MAX_STEPS; step++) {

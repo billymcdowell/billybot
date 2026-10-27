@@ -15,6 +15,7 @@ import {
   PlusIcon,
   RotateCcwIcon,
   SquareIcon,
+  TerminalIcon,
   Trash2Icon,
   XIcon,
 } from "lucide-react";
@@ -22,6 +23,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { ButtonGroup } from "@/components/ui/button-group";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import { CodeBlock, CodeBlockContent } from "@/components/ui/code-block";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -529,15 +531,23 @@ export default function App() {
             {pending && (
               <Item variant="outline" size="sm">
                 <ItemMedia variant="icon">
-                  {pending.req.tool === "create_project" ? <FolderPlusIcon /> : <FilePenIcon />}
+                  {pending.req.tool === "create_project" ? (
+                    <FolderPlusIcon />
+                  ) : pending.req.tool === "run_command" ? (
+                    <TerminalIcon />
+                  ) : (
+                    <FilePenIcon />
+                  )}
                 </ItemMedia>
                 <ItemContent>
                   <ItemTitle>
                     {pending.req.tool === "create_project"
                       ? `Create project ${String(pending.req.args.name)}?`
-                      : pending.req.tool === "edit_file"
-                        ? `Edit ${String(pending.req.args.path)}?`
-                        : `Write ${String(pending.req.args.path)}?`}
+                      : pending.req.tool === "run_command"
+                        ? `Run a command in ${pending.req.where}?`
+                        : pending.req.tool === "edit_file"
+                          ? `Edit ${String(pending.req.args.path)}?`
+                          : `Write ${String(pending.req.args.path)}?`}
                   </ItemTitle>
                   <ItemDescription>
                     {pending.req.who} · {pending.req.where}
@@ -548,9 +558,12 @@ export default function App() {
                   <Button size="sm" variant="outline" onClick={() => answer("deny")}>
                     Deny
                   </Button>
-                  <Button size="sm" variant="outline" onClick={() => answer("always")}>
-                    {pending.req.where === "workspace" ? "Always allow creating" : `Always in ${pending.req.where}`}
-                  </Button>
+                  {/* Commands are never remembered: one "always" would approve every future command. */}
+                  {pending.req.tool !== "run_command" && (
+                    <Button size="sm" variant="outline" onClick={() => answer("always")}>
+                      {pending.req.where === "workspace" ? "Always allow creating" : `Always in ${pending.req.where}`}
+                    </Button>
+                  )}
                   <Button size="sm" onClick={() => answer("once")}>
                     Approve
                   </Button>
@@ -562,6 +575,19 @@ export default function App() {
                       after={String(pending.req.args.content ?? "")}
                       isNew={pending.req.before === null}
                     />
+                  </ItemFooter>
+                )}
+                {pending.req.tool === "run_command" && (
+                  <ItemFooter className="flex-col items-stretch gap-2">
+                    <CodeBlock size="sm">
+                      <CodeBlockContent wrap className="max-h-48">
+                        {String(pending.req.args.command ?? "")}
+                      </CodeBlockContent>
+                    </CodeBlock>
+                    <p className="text-xs text-muted-foreground">
+                      Runs on your Mac as you, starting in {pending.req.where}. The folder lock does not apply to commands:
+                      they can reach any file your account can.
+                    </p>
                   </ItemFooter>
                 )}
                 {pending.req.tool === "edit_file" && (
