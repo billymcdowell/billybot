@@ -336,7 +336,7 @@ export default function App() {
       const recording = await pending;
       const audio = await recording.stop();
       if (Date.now() - recording.startedAt < 400) return; // a quick tap, not speech
-      let text = await transcribe(apiKey, audio);
+      let text = await transcribe(audio);
       if (text && polishOn) text = await polish(apiKey, text).catch(() => text);
       if (text) setInput((prev) => (prev.trim() ? prev.trimEnd() + " " : "") + text);
     } catch (e) {
