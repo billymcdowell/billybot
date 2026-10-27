@@ -193,6 +193,33 @@ fn write_file(workspace: String, project: String, path: String, content: String)
     Ok(format!("Wrote {} bytes to {project}/{path}", content.len()))
 }
 
+/// Replaces one exact snippet in a file. The snippet must appear exactly once, so an
+/// edit can never land in the wrong place or silently change several spots.
+#[tauri::command]
+fn edit_file(
+    workspace: String,
+    project: String,
+    path: String,
+    old_text: String,
+    new_text: String,
+) -> Result<String, String> {
+    if old_text.is_empty() {
+        return Err("old_text must not be empty. To create or replace a whole file, use write_file.".into());
+    }
+    let file = resolve(&project_root(&workspace, &project)?, &path)?;
+    let content = fs::read_to_string(&file).map_err(|e| e.to_string())?;
+    match content.matches(&old_text).count() {
+        0 => Err("old_text was not found. Read the file again and copy the snippet exactly, including spaces and line breaks.".into()),
+        1 => {
+            fs::write(&file, content.replacen(&old_text, &new_text, 1)).map_err(|e| e.to_string())?;
+            Ok(format!("Edited {project}/{path}"))
+        }
+        n => Err(format!(
+            "old_text appears {n} times. Include more surrounding lines so it matches exactly once."
+        )),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -210,8 +237,70 @@ pub fn run() {
             list_dir,
             read_file,
             write_file,
+            edit_file,
             stt::transcribe_local,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh workspace in the temp folder containing one project called "proj".
+    fn workspace(name: &str) -> String {
+        let ws = std::env::temp_dir().join(format!("billybot-test-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        fs::create_dir_all(ws.join("proj")).unwrap();
+        ws.to_string_lossy().to_string()
+    }
+
+    fn edit(ws: &str, path: &str, old: &str, new: &str) -> Result<String, String> {
+        edit_file(ws.into(), "proj".into(), path.into(), old.into(), new.into())
+    }
+
+    #[test]
+    fn edit_replaces_a_single_match() {
+        let ws = workspace("single");
+        let file = format!("{ws}/proj/a.txt");
+        fs::write(&file, "one two three").unwrap();
+        assert!(edit(&ws, "a.txt", "two", "2").is_ok());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "one 2 three");
+    }
+
+    #[test]
+    fn edit_refuses_a_missing_snippet() {
+        let ws = workspace("missing");
+        let file = format!("{ws}/proj/a.txt");
+        fs::write(&file, "one two three").unwrap();
+        assert!(edit(&ws, "a.txt", "four", "4").unwrap_err().contains("not found"));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "one two three");
+    }
+
+    #[test]
+    fn edit_refuses_an_ambiguous_snippet() {
+        let ws = workspace("ambiguous");
+        let file = format!("{ws}/proj/a.txt");
+        fs::write(&file, "x x").unwrap();
+        assert!(edit(&ws, "a.txt", "x", "y").unwrap_err().contains("2 times"));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "x x");
+    }
+
+    #[test]
+    fn edit_refuses_an_empty_snippet() {
+        let ws = workspace("empty");
+        fs::write(format!("{ws}/proj/a.txt"), "abc").unwrap();
+        assert!(edit(&ws, "a.txt", "", "y").is_err());
+    }
+
+    #[test]
+    fn edit_cannot_leave_the_project() {
+        let ws = workspace("escape");
+        fs::create_dir_all(format!("{ws}/other")).unwrap();
+        let outside = format!("{ws}/other/b.txt");
+        fs::write(&outside, "secret").unwrap();
+        assert!(edit(&ws, "../other/b.txt", "secret", "hacked").is_err());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "secret");
+    }
 }
