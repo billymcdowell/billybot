@@ -151,22 +151,24 @@ export default function App() {
     if (workspace) listConversations(workspace).then(setChats);
   }, [workspace]);
 
-  // Hold Option+Space anywhere in the window to dictate; let go to stop.
+  // Hold Command + Option together anywhere in the window to dictate; let go of either to stop.
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
-      if (e.code === "Space" && e.altKey) {
-        e.preventDefault();
-        if (!e.repeat) startDictation();
-      }
+      if (e.metaKey && e.altKey && !e.repeat) startDictation();
     };
     const up = (e: KeyboardEvent) => {
-      if (e.code === "Space" || e.key === "Alt") stopDictation();
+      if (!(e.metaKey && e.altKey)) stopDictation();
     };
+    // If the window loses focus while the keys are down, no key-up arrives, so stop here
+    // or the microphone would stay on.
+    const blur = () => stopDictation();
     window.addEventListener("keydown", down);
     window.addEventListener("keyup", up);
+    window.addEventListener("blur", blur);
     return () => {
       window.removeEventListener("keydown", down);
       window.removeEventListener("keyup", up);
+      window.removeEventListener("blur", blur);
     };
   });
 
@@ -573,7 +575,7 @@ export default function App() {
               <InputGroup>
                 <InputGroupTextarea
                   value={input}
-                  placeholder="Ask something… (Enter to send, hold ⌥ Space to dictate)"
+                  placeholder="Ask something… (Enter to send, hold ⌘ ⌥ to dictate)"
                   className="p-3"
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={(e) => {
@@ -616,7 +618,7 @@ export default function App() {
                     className="ml-auto"
                     onClick={() => (dictation === "recording" ? stopDictation() : startDictation())}
                     disabled={dictation === "working"}
-                    aria-label="Dictate (or hold ⌥ Space)"
+                    aria-label="Dictate (or hold ⌘ ⌥)"
                   >
                     {dictation === "working" ? <Spinner /> : dictation === "recording" ? <SquareIcon /> : <MicIcon />}
                   </InputGroupButton>
