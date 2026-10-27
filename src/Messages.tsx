@@ -54,7 +54,7 @@ const TOOLS: Record<string, { icon: ElementType; done: string; running: string }
 
 // Results the agent writes when a tool didn't do what was asked.
 const isFailure = (result: string) =>
-  /^(Error:|Refused:|Could not|Read-only mode|The user denied|Timed out|Exit code (?!0\b))/.test(result);
+  /^(Error:|Refused:|Could not|Read-only mode|The user denied|Timed out|Cancelled|Exit code (?!0\b))/.test(result);
 
 function callsOf(m: Msg): Call[] {
   if (m.role !== "assistant" || !m.tool_calls) return [];

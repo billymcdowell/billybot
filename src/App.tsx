@@ -254,6 +254,7 @@ export default function App() {
 
   function stop() {
     abortRef.current?.abort();
+    invoke("cancel_commands").catch(() => {}); // kills any command that is running right now
     approvals.forEach((p) => p.resolve("deny")); // unblocks anything waiting on you
     setApprovals([]);
   }

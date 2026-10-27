@@ -193,6 +193,9 @@ async function execute(
   o: AgentOptions,
   delegateSlot: number,
 ): Promise<string> {
+  // After Stop, the rest of this turn's tool calls must not start (they still need a result,
+  // or the API rejects the conversation).
+  if (o.signal?.aborted) return "Cancelled: the user pressed Stop.";
   try {
     const args = JSON.parse(call.args || "{}");
     const isFileTool = ["list_dir", "read_file", ...WRITING_FILE_TOOLS].includes(call.name);
