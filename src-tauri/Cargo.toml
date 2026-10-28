@@ -1,6 +1,6 @@
 [package]
 name = "billybot"
-version = "0.1.0"
+version = "0.1.1"
 description = "A desktop AI coding agent harness built with Tauri and React"
 authors = ["Billy McDowell"]
 license = "MIT"
