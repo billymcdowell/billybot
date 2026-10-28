@@ -12,6 +12,7 @@ const FIELDS: { key: keyof Limits; label: string; unit: string }[] = [
   { key: "outputHeadChars", label: "Command output: keep the start", unit: "characters" },
   { key: "outputTailChars", label: "Command output: keep the end", unit: "characters" },
   { key: "maxResultChars", label: "Largest tool result", unit: "characters" },
+  { key: "budgetUsd", label: "Budget for each chat (0 = none)", unit: "dollars" },
 ];
 
 type Props = { limits: Limits; onChange: (limits: Limits) => void };
@@ -50,7 +51,7 @@ export default function LimitsPopover({ limits, onChange }: Props) {
               <div className="flex items-center gap-2">
                 <Input
                   id={`limit-${key}`}
-                  inputMode="numeric"
+                  inputMode="decimal"
                   value={draft[key] ?? String(limits[key])}
                   onChange={(e) => setDraft({ ...draft, [key]: e.target.value })}
                   onBlur={() => commit(key)}

@@ -109,3 +109,33 @@ describe("searching", () => {
     expect(snippetAround("nothing here", "zzz")).toBeNull();
   });
 });
+
+import { budgetText, forkMessages, isBudgetMessage } from "./history";
+
+describe("budget messages", () => {
+  it("are recognised, and put a chat in the budget state", () => {
+    expect(budgetText(5)).toBe("Stopped: this chat reached its budget of $5.00.");
+    expect(isBudgetMessage(reply(budgetText(12.5)))).toBe(true);
+    expect(isBudgetMessage(reply("Stopped: this chat reached its budget of $5.00. Oh well"))).toBe(false);
+    expect(runState([user("hi"), reply(budgetText(5))])).toBe("budget");
+  });
+});
+
+describe("forkMessages", () => {
+  const convo = [user("1"), calls("a", "b"), result("a"), result("b"), reply("done 1"), user("2"), reply("done 2")];
+
+  it("copies up to a message", () => {
+    expect(forkMessages(convo, 0)).toEqual([user("1")]);
+    expect(forkMessages(convo, 4)).toEqual(convo.slice(0, 5));
+    expect(forkMessages(convo, 99)).toEqual(convo);
+  });
+
+  it("brings an assistant message's tool results with it", () => {
+    expect(forkMessages(convo, 1)).toEqual(convo.slice(0, 4));
+  });
+
+  it("copies nothing for -1, and repairs a cut at an unanswered call", () => {
+    expect(forkMessages(convo, -1)).toEqual([]);
+    expect(forkMessages([user("1"), calls("a")], 1)).toEqual([user("1"), calls("a"), result("a", INTERRUPTED_RESULT)]);
+  });
+});

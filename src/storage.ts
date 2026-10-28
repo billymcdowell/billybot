@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { LazyStore } from "@tauri-apps/plugin-store";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
+import type { ChatUsage } from "./cost";
 import { searchableText, snippetAround } from "./history";
 
 // Small settings, and the "always allow" list, live in one JSON file in the app's data folder.
@@ -35,6 +36,9 @@ export type Conversation = {
   projects: OpenProject[];
   subagents: Record<string, SubagentRun>; // keyed by the delegate_task call id
   stopped?: boolean; // the last run ended because the user pressed Stop
+  usage?: ChatUsage; // what the chat has cost so far
+  budgetExtra?: number; // dollars added to this chat's cap after it ran out
+  forkedFrom?: { chatId: string; messageIndex: number }; // set on a chat made with "Fork from here"
 };
 
 /** What the sidebar needs about a chat, kept in an index so listing never opens every chat. */
@@ -45,6 +49,8 @@ export type ChatSummary = {
   updatedAt: number;
   projects: string[];
   messageCount: number;
+  cost?: number; // dollars spent in the chat
+  forked?: boolean;
 };
 
 // ---------- Simple settings (workspace, model, mode, polish) ----------
@@ -84,6 +90,8 @@ export const summaryOf = (c: Conversation): ChatSummary => ({
   updatedAt: c.updatedAt,
   projects: (c.projects ?? []).map((p) => p.name),
   messageCount: (c.messages ?? []).length,
+  ...(c.usage ? { cost: c.usage.cost } : {}),
+  ...(c.forkedFrom ? { forked: true } : {}),
 });
 
 /** Pinned chats first, then the most recently changed. */
@@ -209,7 +217,7 @@ export function deleteConversation(workspace: string, id: string): Promise<void>
 export async function updateChatMeta(
   workspace: string,
   id: string,
-  change: { title?: string; pinned?: boolean },
+  change: { title?: string; pinned?: boolean; budgetExtra?: number },
 ): Promise<void> {
   const convo = await readChat(workspace, id);
   if (!convo) return;
@@ -218,6 +226,7 @@ export async function updateChatMeta(
     ...convo,
     ...(title ? { title: title.slice(0, 100), titleEdited: true } : {}),
     ...(change.pinned === undefined ? {} : { pinned: change.pinned }),
+    ...(change.budgetExtra === undefined ? {} : { budgetExtra: change.budgetExtra }),
     updatedAt: convo.updatedAt, // renaming isn't activity: don't move the chat to the top
   });
 }

@@ -1,7 +1,10 @@
 import OpenAI from "openai";
 import { invoke } from "@tauri-apps/api/core";
-import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
-import { stepLimitText } from "./history";
+import type {
+  ChatCompletionCreateParamsStreaming,
+  ChatCompletionMessageParam,
+} from "openai/resources/chat/completions";
+import { budgetText, stepLimitText } from "./history";
 import { resolveLimits } from "./limits";
 import { clipInstructions, formatInstructions, INSTRUCTIONS_FILE, type ProjectInstructions } from "./instructions";
 import { checkPermission } from "./permissions";
@@ -138,7 +141,6 @@ async function runSubagent(callId: string, project: string, task: string, o: Age
       projects: [{ name: project, writable: true }],
       onProjectsChange: undefined,
       onSubagent: undefined,
-      onUsage: undefined, // the meter tracks the main conversation, not each subagent's
       messages: run.messages,
       onUpdate: (msgs) => {
         run.messages = msgs;
@@ -167,6 +169,18 @@ export async function runAgent(o: AgentOptions): Promise<ChatCompletionMessagePa
   const messages = [...o.messages];
 
   for (let step = 0; step < MAX_STEPS; step++) {
+    // Stop before spending more if the chat has hit its cap.
+    const cap = o.overBudget?.();
+    if (cap) {
+      messages.push({ role: "assistant", content: budgetText(cap) });
+      o.onUpdate(messages, "");
+      return messages;
+    }
+    // Anything you typed while the agent was working joins the conversation here, between steps.
+    const steering = o.role === "sub" || step === 0 ? [] : (o.takeSteering?.() ?? []);
+    for (const text of steering) messages.push({ role: "user", content: text });
+    if (steering.length) o.onUpdate(messages, "");
+
     // 1. Send the conversation (with a fresh system prompt) and stream the reply.
     // The projects (and so their CLAUDE.md files) can change between steps, so read them each time.
     const instructions = await loadInstructions(o.workspace, o.projects);
@@ -175,13 +189,21 @@ export async function runAgent(o: AgentOptions): Promise<ChatCompletionMessagePa
     const calls: { id: string; name: string; args: string }[] = [];
     try {
       const stream = await client.chat.completions.create(
-        { model: o.model, messages: [system, ...messages], tools, stream: true },
+        // `usage.include` asks OpenRouter to report what the request cost.
+        { model: o.model, messages: [system, ...messages], tools, stream: true, usage: { include: true } } as ChatCompletionCreateParamsStreaming,
         { signal: o.signal },
       );
       for await (const chunk of stream) {
         // OpenRouter reports token usage on the last chunk of a streamed reply.
         if (chunk.usage) {
-          o.onUsage?.({ promptTokens: chunk.usage.prompt_tokens, completionTokens: chunk.usage.completion_tokens });
+          o.onUsage?.({
+            model: o.model,
+            role: o.role ?? "main",
+            who: o.who ?? "Main agent",
+            promptTokens: chunk.usage.prompt_tokens,
+            completionTokens: chunk.usage.completion_tokens,
+            cost: (chunk.usage as { cost?: number }).cost,
+          });
         }
         const delta = chunk.choices[0]?.delta;
         if (!delta) continue;

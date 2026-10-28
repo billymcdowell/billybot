@@ -1,4 +1,5 @@
 import type { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/chat/completions";
+import type { UsageEvent } from "../cost";
 import type { Limits } from "../limits";
 import type { AskFn, ToolCategory } from "../permissions";
 import type { Mode, OpenProject, SubagentRun } from "../storage";
@@ -16,8 +17,12 @@ export type AgentOptions = {
   ask: AskFn;
   onUpdate: (messages: ChatCompletionMessageParam[], streamingText: string) => void;
   onSubagent?: (callId: string, run: SubagentRun) => void; // progress of subagents
-  // Token counts the API reports for each request (main agent only).
-  onUsage?: (usage: { promptTokens: number; completionTokens: number }) => void;
+  // What the API reports for each request, from this agent and (since they inherit it) its subagents.
+  onUsage?: (usage: UsageEvent) => void;
+  // Returns the spending cap if the chat has reached it, so the agent stops before its next request.
+  overBudget?: () => number | null;
+  // Messages the user sent while the agent was working; asked for before each step (main agent only).
+  takeSteering?: () => string[];
   signal?: AbortSignal;
   limits?: Partial<Limits>; // see src/limits.ts; missing values use the defaults
   role?: AgentRole;

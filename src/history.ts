@@ -10,20 +10,27 @@ export const stepLimitText = (steps: number) => `Stopped after ${steps} steps.`;
 export const isStepLimitMessage = (m: Msg | undefined) =>
   m?.role === "assistant" && /^Stopped after \d+ steps\.$/.test(textOf(m.content));
 
+export const budgetText = (cap: number) => `Stopped: this chat reached its budget of $${cap.toFixed(2)}.`;
+export const isBudgetMessage = (m: Msg | undefined) =>
+  m?.role === "assistant" && /^Stopped: this chat reached its budget of \$[\d.]+\.$/.test(textOf(m.content));
+
 /**
  * - none: nothing said yet
  * - done: the agent finished and answered
  * - stopped: the user pressed Stop
  * - limit: the agent ran out of steps
+ * - budget: the chat reached its spending cap
  * - unfinished: the last run ended without an answer (an error, or the app closed)
  */
-export type RunState = "none" | "done" | "stopped" | "limit" | "unfinished";
+export type RunState = "none" | "done" | "stopped" | "limit" | "budget" | "unfinished";
 
 export function runState(messages: Msg[], stopped = false): RunState {
   const last = messages[messages.length - 1];
   if (!last) return "none";
   if (stopped) return "stopped";
-  if (last.role === "assistant" && !last.tool_calls?.length) return isStepLimitMessage(last) ? "limit" : "done";
+  if (last.role === "assistant" && !last.tool_calls?.length) {
+    return isStepLimitMessage(last) ? "limit" : isBudgetMessage(last) ? "budget" : "done";
+  }
   return "unfinished";
 }
 
@@ -87,6 +94,21 @@ export function repairSubagents(subagents: Record<string, SubagentRun>): {
     }
   }
   return { subagents: out, repaired };
+}
+
+// ---------- Forking ----------
+
+/**
+ * The messages up to and including `upTo`, ready to start a new chat from. If that message
+ * is an assistant message that called tools, the tool results come with it.
+ */
+export function forkMessages(messages: Msg[], upTo: number): Msg[] {
+  const last = Math.min(upTo, messages.length - 1);
+  let end = last + 1;
+  if (messages[last]?.role === "assistant") {
+    while (end < messages.length && messages[end].role === "tool") end++;
+  }
+  return repairMessages(messages.slice(0, end)).messages;
 }
 
 // ---------- Titles and search ----------

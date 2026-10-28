@@ -692,6 +692,7 @@ pub fn run() {
             chats::chat_read,
             chats::chat_delete,
             chats::chat_names,
+            chats::write_export,
             search::grep_files,
             search::glob_files,
             run_command,

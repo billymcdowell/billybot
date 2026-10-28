@@ -91,9 +91,11 @@ describe("systemPrompt", () => {
 describe("runAgent", () => {
   it("returns a plain reply and reports usage", async () => {
     const onUsage = vi.fn();
-    const out = await run([{ text: "hello", usage: { prompt: 10, completion: 2 } }], { onUsage });
+    const out = await run([{ text: "hello", usage: { prompt: 10, completion: 2, cost: 0.004 } }], { onUsage });
     expect(last(out)).toEqual({ role: "assistant", content: "hello" });
-    expect(onUsage).toHaveBeenCalledWith({ promptTokens: 10, completionTokens: 2 });
+    expect(onUsage).toHaveBeenCalledWith({
+      model: "m", role: "main", who: "Main agent", promptTokens: 10, completionTokens: 2, cost: 0.004,
+    });
   });
 
   it("sends the system prompt first and the tool definitions", async () => {
@@ -393,5 +395,62 @@ describe("Stop", () => {
       return say("partial report");
     });
     expect(last(onSubagent.mock.calls)[1]).toMatchObject({ status: "stopped" });
+  });
+});
+
+describe("cost and budget", () => {
+  it("asks OpenRouter to report each request's cost", async () => {
+    await run([say("ok")]);
+    expect(client.create.mock.calls[0][0]).toMatchObject({ usage: { include: true }, stream: true });
+  });
+
+  it("reports a subagent's requests too, labelled as the subagent's", async () => {
+    backend({ check_project: () => undefined });
+    const onUsage = vi.fn();
+    const sub = (): Reply => ({ text: "report", usage: { prompt: 5, completion: 1, cost: 0.002 } });
+    await run([useTools(call("delegate_task", { project: "app", task: "t" })), { text: "ok", usage: { prompt: 9, completion: 3, cost: 0.01 } }], { onUsage }, "bypass", sub);
+    const events = onUsage.mock.calls.map((c) => c[0]);
+    expect(events).toHaveLength(2);
+    expect(events).toContainEqual(expect.objectContaining({ role: "sub", who: "app agent", cost: 0.002 }));
+    expect(events).toContainEqual(expect.objectContaining({ role: "main", cost: 0.01 }));
+  });
+
+  it("stops at once, without calling the model, if the chat is already over its cap", async () => {
+    const out = await run([say("never reached")], { overBudget: () => 5 });
+    expect(last(out)).toEqual({ role: "assistant", content: "Stopped: this chat reached its budget of $5.00." });
+    expect(client.create).not.toHaveBeenCalled();
+  });
+
+  it("checks between steps, so a long task is cut off part-way", async () => {
+    let calls = 0;
+    backend({ list_projects: () => [] });
+    const out = await run(
+      [useTools(call("list_projects")), useTools(call("list_projects")), say("never reached")],
+      { overBudget: () => (++calls > 2 ? 1 : null) },
+    );
+    expect(client.create).toHaveBeenCalledTimes(2);
+    expect(last(out)).toMatchObject({ role: "assistant", content: expect.stringContaining("budget of $1.00") });
+  });
+});
+
+describe("messages sent while the agent works", () => {
+  it("joins them to the conversation before the next request", async () => {
+    const queue = ["also add tests"];
+    backend({ list_projects: () => [] });
+    const out = await run([useTools(call("list_projects")), say("ok")], { takeSteering: () => queue.splice(0) });
+    // asked before each step after the first, so the text lands after the first step's tool result
+    const roles = out.map((m) => m.role);
+    expect(roles).toEqual(["user", "assistant", "tool", "user", "assistant"]);
+    expect(out[3]).toEqual({ role: "user", content: "also add tests" });
+    const second = client.requests[1].messages.map((m) => m.role);
+    expect(second.slice(-2)).toEqual(["tool", "user"]);
+  });
+
+  it("is not offered to subagents", async () => {
+    backend({ check_project: () => undefined });
+    const takeSteering = vi.fn(() => ["steer"]);
+    await run([useTools(call("delegate_task", { project: "app", task: "t" })), say("ok")], { takeSteering });
+    // asked before the main agent's second step only: not before its first, and never for the subagent
+    expect(takeSteering).toHaveBeenCalledTimes(1);
   });
 });

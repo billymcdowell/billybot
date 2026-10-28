@@ -98,6 +98,21 @@ describe("saving and loading", () => {
   });
 });
 
+describe("cost and forks in the list", () => {
+  it("shows what a chat cost and whether it is a fork", async () => {
+    const usage = { cost: 0.42, promptTokens: 1, completionTokens: 1, requests: 1, estimated: 0, unpriced: 0, turns: {} };
+    await saveConversation(ws, chat("a", { usage, forkedFrom: { chatId: "x", messageIndex: 2 }, budgetExtra: 3 }));
+    expect(await listChats(ws)).toEqual([expect.objectContaining({ id: "a", cost: 0.42, forked: true })]);
+    expect(await loadChat(ws, "a")).toMatchObject({ usage, budgetExtra: 3, forkedFrom: { chatId: "x", messageIndex: 2 } });
+  });
+
+  it("can grant extra budget without touching anything else", async () => {
+    await saveConversation(ws, chat("a", { updatedAt: 7 }));
+    await updateChatMeta(ws, "a", { budgetExtra: 5 });
+    expect(await loadChat(ws, "a")).toMatchObject({ budgetExtra: 5, updatedAt: 7, title: "chat a" });
+  });
+});
+
 describe("listing", () => {
   it("puts pinned chats first, then newest first", async () => {
     await saveConversation(ws, chat("old", { updatedAt: 1 }));

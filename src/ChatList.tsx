@@ -1,4 +1,4 @@
-import { MoreHorizontalIcon, PencilIcon, PinIcon, PinOffIcon, SearchIcon, Trash2Icon } from "lucide-react";
+import { GitForkIcon, MoreHorizontalIcon, PencilIcon, PinIcon, PinOffIcon, SearchIcon, Trash2Icon } from "lucide-react";
 import { useEffect, useState } from "react";
 import {
   DropdownMenu,
@@ -17,6 +17,7 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
 } from "@/components/ui/sidebar";
+import { formatCost } from "./cost";
 import type { ChatSummary, SearchHit } from "./storage";
 
 type Props = {
@@ -109,13 +110,13 @@ export default function ChatList({ chats, activeId, busy, onOpen, onDelete, onRe
                   >
                     <span className="flex w-full items-center gap-1">
                       {c.pinned && <PinIcon className="size-3 shrink-0 text-muted-foreground" aria-label="Pinned" />}
+                      {c.forked && <GitForkIcon className="size-3 shrink-0 text-muted-foreground" aria-label="Forked" />}
                       <span className="truncate">{c.title}</span>
                     </span>
-                    {(hits.get(c.id) || c.projects.length > 0) && (
-                      <span className="w-full truncate text-xs text-muted-foreground">
-                        {hits.get(c.id) ?? c.projects.join(", ")}
-                      </span>
-                    )}
+                    {(() => {
+                      const detail = hits.get(c.id) ?? [c.projects.join(", "), c.cost ? formatCost(c.cost) : ""].filter(Boolean).join(" · ");
+                      return detail && <span className="w-full truncate text-xs text-muted-foreground">{detail}</span>;
+                    })()}
                   </SidebarMenuButton>
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>

@@ -4,7 +4,7 @@ import type { ApprovalRequest } from "../permissions";
 type Delta = { content?: string; tool_calls?: { index: number; id?: string; function?: { name?: string; arguments?: string } }[] };
 
 /** One streamed model reply, as the chunks the OpenAI SDK would yield. */
-export type Reply = { text?: string; calls?: { id: string; name: string; args: object }[]; usage?: { prompt: number; completion: number } };
+export type Reply = { text?: string; calls?: { id: string; name: string; args: object }[]; usage?: { prompt: number; completion: number; cost?: number } };
 
 export const say = (text: string): Reply => ({ text });
 export const call = (name: string, args: object = {}, id = `call_${name}`) => ({ id, name, args });
@@ -20,7 +20,7 @@ async function* chunks(reply: Reply) {
     };
   }
   if (reply.usage) {
-    yield { choices: [], usage: { prompt_tokens: reply.usage.prompt, completion_tokens: reply.usage.completion } };
+    yield { choices: [], usage: { prompt_tokens: reply.usage.prompt, completion_tokens: reply.usage.completion, cost: reply.usage.cost } };
   }
 }
 

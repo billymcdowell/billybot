@@ -128,6 +128,41 @@ pub fn chat_names(app: tauri::AppHandle, workspace: String) -> Result<Vec<String
     names(&base(&app)?, &workspace)
 }
 
+// ---------- Export ----------
+
+const MAX_EXPORT_BYTES: usize = 50_000_000;
+
+/// Where an export may be written: a new or existing plain `.md` or `.json` file, in a folder
+/// that exists. The save dialog picks the path; this keeps a stray call from writing anything else.
+fn check_export_path(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err("Choose a full path for the export".into());
+    }
+    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+    if !matches!(ext.as_deref(), Some("md" | "json")) {
+        return Err("Exports are saved as .md or .json files".into());
+    }
+    let parent = path.parent().ok_or("Invalid path")?;
+    if !parent.is_dir() {
+        return Err(format!("Folder does not exist: {}", parent.display()));
+    }
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err("Refused: that file is a link".into()),
+        Ok(meta) if !meta.is_file() => Err("That path is not a file".into()),
+        _ => Ok(()),
+    }
+}
+
+#[tauri::command]
+pub fn write_export(path: String, contents: String) -> Result<(), String> {
+    if contents.len() > MAX_EXPORT_BYTES {
+        return Err("That export is too large to save".into());
+    }
+    let path = PathBuf::from(path);
+    check_export_path(&path)?;
+    fs::write(&path, contents).map_err(|e| format!("Couldn't save the export: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +264,36 @@ mod tests {
         fs::create_dir(dir.join("c1.json")).unwrap();
         assert!(write(&base, "/ws", "c1", "new").is_err());
         assert!(!dir.join("c1.json.tmp").exists());
+    }
+
+    #[test]
+    fn exports_go_only_to_md_or_json_files_in_existing_folders() {
+        let dir = temp("export");
+        fs::create_dir_all(&dir).unwrap();
+        let ok = dir.join("chat.md");
+        assert!(check_export_path(&ok).is_ok());
+        assert!(check_export_path(&dir.join("chat.JSON")).is_ok());
+        assert!(check_export_path(&dir.join("chat.sh")).is_err());
+        assert!(check_export_path(&dir.join("chat")).is_err());
+        assert!(check_export_path(&dir.join("missing/chat.md")).is_err());
+        assert!(check_export_path(Path::new("relative/chat.md")).is_err());
+        fs::create_dir(dir.join("folder.md")).unwrap();
+        assert!(check_export_path(&dir.join("folder.md")).is_err());
+        write_export(ok.to_string_lossy().into(), "# hi".into()).unwrap();
+        assert_eq!(fs::read_to_string(&ok).unwrap(), "# hi");
+        // overwriting an existing export is fine (the save dialog already asked)
+        write_export(ok.to_string_lossy().into(), "# again".into()).unwrap();
+        assert_eq!(fs::read_to_string(&ok).unwrap(), "# again");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_export_will_not_write_through_a_link() {
+        let dir = temp("export-link");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("target.txt"), "keep").unwrap();
+        std::os::unix::fs::symlink(dir.join("target.txt"), dir.join("chat.md")).unwrap();
+        assert!(write_export(dir.join("chat.md").to_string_lossy().into(), "x".into()).is_err());
+        assert_eq!(fs::read_to_string(dir.join("target.txt")).unwrap(), "keep");
     }
 }

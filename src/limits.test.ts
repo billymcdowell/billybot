@@ -20,4 +20,11 @@ describe("resolveLimits", () => {
     const l = resolveLimits({ defaultTimeoutSecs: 600, maxTimeoutSecs: 120 });
     expect(l.defaultTimeoutSecs).toBe(120);
   });
+
+  it("keeps cents on the budget and treats 0 as off", () => {
+    expect(resolveLimits({ budgetUsd: 2.456 }).budgetUsd).toBe(2.46);
+    expect(resolveLimits({ budgetUsd: -4 }).budgetUsd).toBe(0);
+    expect(resolveLimits({ budgetUsd: 99_999 }).budgetUsd).toBe(1000);
+    expect(DEFAULT_LIMITS.budgetUsd).toBe(0);
+  });
 });

@@ -6,6 +6,7 @@ export type Limits = {
   outputHeadChars: number; // how much of the start of a command's output is kept
   outputTailChars: number; // ...and of the end
   maxResultChars: number; // the most any one tool result may send to the model
+  budgetUsd: number; // the most one chat may spend, in dollars; 0 means no limit
 };
 
 export const DEFAULT_LIMITS: Limits = {
@@ -14,6 +15,7 @@ export const DEFAULT_LIMITS: Limits = {
   outputHeadChars: 10_000,
   outputTailChars: 20_000,
   maxResultChars: 100_000,
+  budgetUsd: 0,
 };
 
 // [min, max] for each. The Rust side enforces the same ceilings.
@@ -23,6 +25,7 @@ export const LIMIT_BOUNDS: Record<keyof Limits, [number, number]> = {
   outputHeadChars: [0, 200_000],
   outputTailChars: [0, 200_000],
   maxResultChars: [5_000, 400_000],
+  budgetUsd: [0, 1000],
 };
 
 /** Fills in anything missing, clamps every value to its bounds, and keeps the default timeout under the maximum. */
@@ -32,7 +35,9 @@ export function resolveLimits(saved?: Partial<Limits>): Limits {
     const v = saved?.[key];
     if (typeof v === "number" && Number.isFinite(v)) {
       const [min, max] = LIMIT_BOUNDS[key];
-      out[key] = Math.min(max, Math.max(min, Math.round(v)));
+      // dollars keep cents; everything else is a whole number
+      const rounded = key === "budgetUsd" ? Math.round(v * 100) / 100 : Math.round(v);
+      out[key] = Math.min(max, Math.max(min, rounded));
     }
   }
   out.defaultTimeoutSecs = Math.min(out.defaultTimeoutSecs, out.maxTimeoutSecs);

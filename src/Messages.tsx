@@ -8,13 +8,17 @@ import {
   FolderPlusIcon,
   FolderTreeIcon,
   FolderXIcon,
+  GitForkIcon,
   ListIcon,
+  PencilIcon,
   SearchIcon,
   TerminalIcon,
   WrenchIcon,
 } from "lucide-react";
 import { Bubble, BubbleContent } from "@/components/ui/bubble";
+import { Button } from "@/components/ui/button";
 import { CodeBlock, CodeBlockContent } from "@/components/ui/code-block";
+import { Textarea } from "@/components/ui/textarea";
 import { Message, MessageContent } from "@/components/ui/message";
 import {
   MessageScroller,
@@ -36,6 +40,7 @@ import {
 } from "@/components/ui/trace";
 import { textOf } from "./agent";
 import Markdown from "./Markdown";
+import { formatCost } from "./cost";
 import type { SubagentRun } from "./storage";
 
 type Msg = ChatCompletionMessageParam;
@@ -163,15 +168,42 @@ function SubagentLine({ run }: { run: SubagentRun }) {
   );
 }
 
+export type EditingMessage = { index: number; text: string };
+
 type Props = {
   messages: Msg[];
   streaming: string; // text of the reply as it streams in
   subagents?: Record<string, SubagentRun>;
+  turnCosts?: Record<string, number>; // dollars per turn, keyed by the index of the turn's user message
+  busy?: boolean; // hides the per-message actions while the agent works
+  onFork?: (index: number) => void;
+  onEdit?: (index: number) => void;
+  editing?: EditingMessage | null;
+  onEditChange?: (text: string) => void;
+  onEditCancel?: () => void;
+  onEditSubmit?: () => void;
 };
 
+/** Small buttons that appear when you hover (or focus) a message. */
+const actionsClass =
+  "flex gap-1 opacity-0 transition-opacity group-hover/msg:opacity-100 focus-within:opacity-100 pointer-coarse:opacity-100";
+
 /** The Chat pattern: a scrolling thread of Message turns that follows new output. */
-export default function MessageList({ messages, streaming, subagents = {} }: Props) {
+export default function MessageList({
+  messages,
+  streaming,
+  subagents = {},
+  turnCosts = {},
+  busy = false,
+  onFork,
+  onEdit,
+  editing,
+  onEditChange,
+  onEditCancel,
+  onEditSubmit,
+}: Props) {
   const results = resultsOf(messages);
+  let turn = -1; // index of the user message that started the turn being drawn
   return (
     <MessageScrollerProvider autoScroll>
       <MessageScroller>
@@ -179,13 +211,55 @@ export default function MessageList({ messages, streaming, subagents = {} }: Pro
           <MessageScrollerContent className="mx-auto w-full max-w-3xl gap-6 p-4">
             {messages.map((m, i) => {
               if (m.role === "user") {
+                turn = i;
+                const isEditing = editing?.index === i;
                 return (
                   <MessageScrollerItem key={i} messageId={String(i)} scrollAnchor>
                     <Message align="end">
-                      <MessageContent>
-                        <Bubble align="end" variant="muted">
-                          <BubbleContent className="whitespace-pre-wrap">{textOf(m.content)}</BubbleContent>
-                        </Bubble>
+                      <MessageContent className="group/msg items-end">
+                        {isEditing ? (
+                          <div className="flex w-full flex-col gap-2">
+                            <Textarea
+                              autoFocus
+                              rows={3}
+                              value={editing.text}
+                              aria-label="Edit your message"
+                              onChange={(e) => onEditChange?.(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) onEditSubmit?.();
+                                if (e.key === "Escape") onEditCancel?.();
+                              }}
+                            />
+                            <div className="flex justify-end gap-2">
+                              <Button size="sm" variant="ghost" onClick={onEditCancel}>
+                                Cancel
+                              </Button>
+                              <Button size="sm" onClick={onEditSubmit} disabled={!editing.text.trim()}>
+                                Resend
+                              </Button>
+                            </div>
+                          </div>
+                        ) : (
+                          <>
+                            <Bubble align="end" variant="muted">
+                              <BubbleContent className="whitespace-pre-wrap">{textOf(m.content)}</BubbleContent>
+                            </Bubble>
+                            {!busy && (onEdit || onFork) && (
+                              <div className={actionsClass}>
+                                {onEdit && (
+                                  <Button size="xs" variant="ghost" onClick={() => onEdit(i)}>
+                                    <PencilIcon /> Edit
+                                  </Button>
+                                )}
+                                {onFork && (
+                                  <Button size="xs" variant="ghost" onClick={() => onFork(i)}>
+                                    <GitForkIcon /> Fork
+                                  </Button>
+                                )}
+                              </div>
+                            )}
+                          </>
+                        )}
                       </MessageContent>
                     </Message>
                   </MessageScrollerItem>
@@ -193,10 +267,13 @@ export default function MessageList({ messages, streaming, subagents = {} }: Pro
               }
               if (m.role !== "assistant") return null; // tool results show inside their Trace line
               const calls = callsOf(m);
+              const next = messages[i + 1];
+              const endsTurn = !next || next.role === "user"; // the last thing the agent said before you spoke again
+              const cost = turnCosts[String(turn)];
               return (
                 <MessageScrollerItem key={i} messageId={String(i)}>
                   <Message>
-                    <MessageContent className="gap-2">
+                    <MessageContent className="group/msg gap-2">
                       {textOf(m.content) && <Markdown>{textOf(m.content)}</Markdown>}
                       {calls.length > 0 && (
                         <Trace>
@@ -208,6 +285,18 @@ export default function MessageList({ messages, streaming, subagents = {} }: Pro
                             ),
                           )}
                         </Trace>
+                      )}
+                      {endsTurn && !busy && (cost !== undefined || onFork) && (
+                        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                          {cost !== undefined && <span title="What this turn cost">{formatCost(cost)}</span>}
+                          {onFork && (
+                            <div className={actionsClass}>
+                              <Button size="xs" variant="ghost" onClick={() => onFork(i)}>
+                                <GitForkIcon /> Fork from here
+                              </Button>
+                            </div>
+                          )}
+                        </div>
                       )}
                     </MessageContent>
                   </Message>
