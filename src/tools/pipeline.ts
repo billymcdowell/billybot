@@ -28,7 +28,12 @@ export function truncateStage(max = MAX_RESULT_CHARS): ResultStage {
   };
 }
 
-export const DEFAULT_STAGES: ResultStage[] = [truncateStage()];
+/** The stages for one agent run, using the user's limits. */
+export function stagesFor(limits?: { maxResultChars?: number }): ResultStage[] {
+  return [truncateStage(limits?.maxResultChars ?? MAX_RESULT_CHARS)];
+}
+
+export const DEFAULT_STAGES: ResultStage[] = stagesFor();
 
 /** Runs the stages in order, each one getting the previous one's output. */
 export async function processResult(

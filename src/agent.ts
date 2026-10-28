@@ -1,12 +1,13 @@
 import OpenAI from "openai";
 import { invoke } from "@tauri-apps/api/core";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
+import { resolveLimits } from "./limits";
 import { clipInstructions, formatInstructions, INSTRUCTIONS_FILE, type ProjectInstructions } from "./instructions";
 import { checkPermission } from "./permissions";
 import type { OpenProject, SubagentRun } from "./storage";
 import { MAX_OPEN_PROJECTS } from "./tools/access";
 import { getTool, toolsFor } from "./tools";
-import { processResult, type ResultInfo } from "./tools/pipeline";
+import { processResult, stagesFor, type ResultInfo } from "./tools/pipeline";
 import type { AgentOptions } from "./tools/types";
 
 export { toolsFor };
@@ -68,7 +69,8 @@ export function systemPrompt(
     `Workspace: ${o.workspace}`,
     `Open projects: ${open}`,
     "Every file path starts with a project name, e.g. \"my-app/src/index.ts\".",
-    "To change an existing file, read it and use edit_file for the part that changes; use write_file for new files or complete rewrites.",
+    "To change an existing file, read it and use edit_file for the part that changes (multi_edit for several changes to one file); use write_file for new files or complete rewrites.",
+    "To find things, use grep (file contents) and glob (file names) rather than reading files one by one. Long files are read in parts: use read_file's offset to continue.",
     "Use run_command for things only a shell can do, such as running tests or a build. The user approves every command, so don't run commands you don't need, and never run anything destructive or that reaches outside the project unless the user asked for it.",
     "When a task starts, call list_projects to find the right project and open it. Create a project only if nothing fits.",
     `Open projects read-only unless you need to change them. At most ${MAX_OPEN_PROJECTS} can be open; close ones you no longer need.`,
@@ -119,7 +121,7 @@ async function execute(
     status = "error";
     text = `Error: ${e instanceof Error ? e.message : String(e)}`;
   }
-  return processResult(text, { tool: call.name, who, status });
+  return processResult(text, { tool: call.name, who, status }, stagesFor(resolveLimits(o.limits)));
 }
 
 // ---------- Subagents ----------

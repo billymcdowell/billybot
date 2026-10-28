@@ -1,4 +1,5 @@
 mod procgroup;
+mod search;
 mod stt;
 
 use std::fs;
@@ -120,7 +121,7 @@ fn check_name(name: &str) -> Result<(), String> {
 
 /// The real path of a project, guaranteed to be a folder directly inside the workspace.
 /// This also catches a project folder that is a symlink pointing somewhere else.
-fn project_root(workspace: &str, project: &str) -> Result<PathBuf, String> {
+pub(crate) fn project_root(workspace: &str, project: &str) -> Result<PathBuf, String> {
     check_name(project)?;
     let ws = fs::canonicalize(workspace).map_err(|e| format!("Workspace not found: {e}"))?;
     let root = fs::canonicalize(ws.join(project))
@@ -207,7 +208,7 @@ fn create_project(workspace: String, name: String) -> Result<String, String> {
 
 /// Turns a path inside a project into a real path, and refuses anything
 /// that ends up outside that project (`../`, absolute paths, symlinks).
-fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
     let full = root.join(path);
     let resolved = match fs::canonicalize(&full) {
         Ok(p) => p,
@@ -259,8 +260,111 @@ fn write_file(workspace: String, project: String, path: String, content: String)
     Ok(format!("Wrote {} bytes to {project}/{path}", content.len()))
 }
 
-/// Replaces one exact snippet in a file. The snippet must appear exactly once, so an
-/// edit can never land in the wrong place or silently change several spots.
+// Limits for what read_lines hands the model in one go. The model asks for more with `offset`.
+const READ_MAX_LINES: usize = 2000;
+const READ_MAX_CHARS: usize = 100_000;
+const READ_MAX_FILE_BYTES: u64 = 50_000_000;
+
+/// The part of `text` the model asked for, with a header saying which lines these are when it
+/// isn't the whole file. `offset` is a 1-based line number. A file that fits is returned as is.
+fn slice_lines(text: &str, offset: Option<usize>, limit: Option<usize>) -> Result<String, String> {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let total = lines.len();
+    if total == 0 {
+        return Ok(String::new());
+    }
+    let start = offset.unwrap_or(1).max(1);
+    if start > total {
+        return Err(format!("offset {start} is past the end of the file, which has {total} lines"));
+    }
+    let max_lines = limit.unwrap_or(READ_MAX_LINES).clamp(1, READ_MAX_LINES);
+
+    let mut out = String::new();
+    let mut last = start - 1; // 1-based number of the last line included
+    let mut cut_in_line = false;
+    for line in &lines[start - 1..] {
+        if last - (start - 1) >= max_lines {
+            break;
+        }
+        if out.len() + line.len() > READ_MAX_CHARS {
+            if last == start - 1 {
+                // A single line longer than the whole budget (a minified file): keep its start.
+                let keep = line.char_indices().nth(READ_MAX_CHARS).map_or(line.len(), |(i, _)| i);
+                out.push_str(&line[..keep]);
+                last += 1;
+                cut_in_line = true;
+            }
+            break;
+        }
+        out.push_str(line);
+        last += 1;
+    }
+
+    if start == 1 && last == total && !cut_in_line {
+        return Ok(out);
+    }
+    let note = if cut_in_line {
+        format!(" Line {last} is longer than {READ_MAX_CHARS} characters, so only its start is shown.")
+    } else if last < total {
+        format!(" Call read_file again with offset={} to continue.", last + 1)
+    } else {
+        " End of file.".to_string()
+    };
+    Ok(format!("[lines {start}-{last} of {total}.{note}]\n{out}"))
+}
+
+/// What the model's read_file tool uses: a text file, or part of one. Binary files and files
+/// too big to be worth reading are refused with a reason the model can act on.
+#[tauri::command]
+fn read_lines(
+    workspace: String,
+    project: String,
+    path: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<String, String> {
+    let file = resolve(&project_root(&workspace, &project)?, &path)?;
+    let size = fs::metadata(&file).map_err(|e| e.to_string())?.len();
+    if size > READ_MAX_FILE_BYTES {
+        return Err(format!(
+            "{path} is {} MB, too big to read. Use grep to find the part you need, or run_command (for example head or sed).",
+            size / 1_000_000
+        ));
+    }
+    let bytes = fs::read(&file).map_err(|e| e.to_string())?;
+    if bytes.iter().take(8192).any(|&b| b == 0) {
+        return Err(format!("{path} looks like a binary file ({size} bytes), not text."));
+    }
+    let text = String::from_utf8(bytes).map_err(|_| format!("{path} is not valid UTF-8 text."))?;
+    slice_lines(&text, offset, limit)
+}
+
+#[derive(serde::Deserialize)]
+struct Edit {
+    old_text: String,
+    new_text: String,
+}
+
+/// Applies the edits in order, each to the result of the one before. Every `old_text` must
+/// match exactly once, so an edit can never land in the wrong place or silently change
+/// several spots. If any edit fails, nothing is returned and the error says which one.
+fn apply_edits(content: &str, edits: &[Edit]) -> Result<String, String> {
+    let mut text = content.to_string();
+    for (i, e) in edits.iter().enumerate() {
+        let at = if edits.len() > 1 { format!("Edit {} of {}: ", i + 1, edits.len()) } else { String::new() };
+        if e.old_text.is_empty() {
+            return Err(format!("{at}old_text must not be empty. To create or replace a whole file, use write_file."));
+        }
+        match text.matches(&e.old_text).count() {
+            0 => return Err(format!("{at}old_text was not found. Read the file again and copy the snippet exactly, including spaces and line breaks.")),
+            1 => text = text.replacen(&e.old_text, &e.new_text, 1),
+            n => return Err(format!("{at}old_text appears {n} times. Include more surrounding lines so it matches exactly once.")),
+        }
+    }
+    Ok(text)
+}
+
+/// Replaces one exact snippet in a file.
 #[tauri::command]
 fn edit_file(
     workspace: String,
@@ -269,21 +373,34 @@ fn edit_file(
     old_text: String,
     new_text: String,
 ) -> Result<String, String> {
-    if old_text.is_empty() {
-        return Err("old_text must not be empty. To create or replace a whole file, use write_file.".into());
+    let file = resolve(&project_root(&workspace, &project)?, &path)?;
+    let content = fs::read_to_string(&file).map_err(|e| e.to_string())?;
+    let updated = apply_edits(&content, &[Edit { old_text, new_text }])?;
+    fs::write(&file, updated).map_err(|e| e.to_string())?;
+    Ok(format!("Edited {project}/{path}"))
+}
+
+const MAX_EDITS: usize = 100;
+
+/// Several edits to one file, all or nothing: the file is written once, and only if every edit applied.
+#[tauri::command]
+fn multi_edit(
+    workspace: String,
+    project: String,
+    path: String,
+    edits: Vec<Edit>,
+) -> Result<String, String> {
+    if edits.is_empty() {
+        return Err("edits must not be empty".into());
+    }
+    if edits.len() > MAX_EDITS {
+        return Err(format!("At most {MAX_EDITS} edits at a time. Split them up."));
     }
     let file = resolve(&project_root(&workspace, &project)?, &path)?;
     let content = fs::read_to_string(&file).map_err(|e| e.to_string())?;
-    match content.matches(&old_text).count() {
-        0 => Err("old_text was not found. Read the file again and copy the snippet exactly, including spaces and line breaks.".into()),
-        1 => {
-            fs::write(&file, content.replacen(&old_text, &new_text, 1)).map_err(|e| e.to_string())?;
-            Ok(format!("Edited {project}/{path}"))
-        }
-        n => Err(format!(
-            "old_text appears {n} times. Include more surrounding lines so it matches exactly once."
-        )),
-    }
+    let updated = apply_edits(&content, &edits).map_err(|e| format!("{e} No edits were applied."))?;
+    fs::write(&file, updated).map_err(|e| e.to_string())?;
+    Ok(format!("Made {} edits to {project}/{path}", edits.len()))
 }
 
 // ---------- Running commands ----------
@@ -294,6 +411,8 @@ fn edit_file(
 
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 const MAX_TIMEOUT_SECS: u64 = 300;
+const ABSOLUTE_MAX_TIMEOUT_SECS: u64 = 3600;
+const MAX_KEPT_CHARS: usize = 200_000; // per end; the command's output is read up to 1 MB anyway
 const READ_LIMIT: usize = 1_000_000; // bytes kept while a command runs; the rest is thrown away
 const HEAD_CHARS: usize = 10_000;
 const TAIL_CHARS: usize = 20_000;
@@ -370,14 +489,14 @@ fn shell_command(command: &str) -> Command {
 }
 
 /// Keeps the start and the end of long output, which is where errors usually are.
-fn shorten(text: &str) -> String {
+fn shorten(text: &str, head_chars: usize, tail_chars: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= HEAD_CHARS + TAIL_CHARS {
+    if chars.len() <= head_chars + tail_chars {
         return text.to_string();
     }
-    let head: String = chars[..HEAD_CHARS].iter().collect();
-    let tail: String = chars[chars.len() - TAIL_CHARS..].iter().collect();
-    format!("{head}\n[... {} characters omitted ...]\n{tail}", chars.len() - HEAD_CHARS - TAIL_CHARS)
+    let head: String = chars[..head_chars].iter().collect();
+    let tail: String = chars[chars.len() - tail_chars..].iter().collect();
+    format!("{head}\n[... {} characters omitted ...]\n{tail}", chars.len() - head_chars - tail_chars)
 }
 
 /// One flag per command that is running right now. Stop sets them all, and each command's
@@ -387,7 +506,20 @@ static RUNNING: Mutex<Vec<Arc<AtomicBool>>> = Mutex::new(Vec::new());
 /// Runs a command with the project as its starting folder and returns its exit code and
 /// combined output. Nothing is typed into it, and after it finishes, times out or is
 /// cancelled (by setting `cancel`) anything it left running is killed.
+#[cfg(test)]
 fn run_shell(root: &Path, command: &str, timeout: Duration, cancel: &AtomicBool) -> Result<String, String> {
+    run_shell_limited(root, command, timeout, cancel, HEAD_CHARS, TAIL_CHARS)
+}
+
+/// `run_shell` with the amount of output kept (start and end, in characters) chosen by the caller.
+fn run_shell_limited(
+    root: &Path,
+    command: &str,
+    timeout: Duration,
+    cancel: &AtomicBool,
+    head_chars: usize,
+    tail_chars: usize,
+) -> Result<String, String> {
     // One pipe for both stdout and stderr, so the output keeps its real order.
     let (mut reader, writer) = std::io::pipe().map_err(|e| e.to_string())?;
     let mut cmd = shell_command(command);
@@ -455,7 +587,7 @@ fn run_shell(root: &Path, command: &str, timeout: Duration, cancel: &AtomicBool)
             None => "Exit code unknown (stopped by a signal)".to_string(),
         }
     };
-    let output = shorten(String::from_utf8_lossy(&bytes).trim_end());
+    let output = shorten(String::from_utf8_lossy(&bytes).trim_end(), head_chars, tail_chars);
     let note = if capped { "\n[output cut off after 1 MB]" } else { "" };
     Ok(format!("{header}\n{}{note}", if output.is_empty() { "(no output)" } else { &output }))
 }
@@ -466,19 +598,26 @@ async fn run_command(
     project: String,
     command: String,
     timeout_seconds: Option<u64>,
+    max_timeout_seconds: Option<u64>,
+    head_chars: Option<usize>,
+    tail_chars: Option<usize>,
 ) -> Result<String, String> {
     if command.trim().is_empty() {
         return Err("command must not be empty".into());
     }
     let root = project_root(&workspace, &project)?;
-    let secs = timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECS).clamp(1, MAX_TIMEOUT_SECS);
+    // The user can raise the limit in settings, but never past an hour.
+    let max_secs = max_timeout_seconds.unwrap_or(MAX_TIMEOUT_SECS).clamp(1, ABSOLUTE_MAX_TIMEOUT_SECS);
+    let secs = timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECS).clamp(1, max_secs);
+    let head = head_chars.unwrap_or(HEAD_CHARS).min(MAX_KEPT_CHARS);
+    let tail = tail_chars.unwrap_or(TAIL_CHARS).min(MAX_KEPT_CHARS);
     // Register a cancel flag so Stop can reach this command while it runs.
     let cancel = Arc::new(AtomicBool::new(false));
     RUNNING.lock().map_err(|_| "Lock failed")?.push(cancel.clone());
     let flag = cancel.clone();
     // Commands take a while, so run off the main thread.
     let result = tauri::async_runtime::spawn_blocking(move || {
-        run_shell(&root, &command, Duration::from_secs(secs), &flag)
+        run_shell_limited(&root, &command, Duration::from_secs(secs), &flag, head, tail)
     })
     .await
     .map_err(|e| e.to_string());
@@ -545,7 +684,11 @@ pub fn run() {
             list_dir,
             read_file,
             write_file,
+            read_lines,
             edit_file,
+            multi_edit,
+            search::grep_files,
+            search::glob_files,
             run_command,
             cancel_commands,
             stt::transcribe_local,
@@ -916,5 +1059,133 @@ mod tests {
         let ws = workspace("cmd-noproject");
         assert!(project_root(&ws, "../etc").is_err());
         assert!(project_root(&ws, "missing").is_err());
+    }
+
+    // ----- read_lines -----
+
+    fn numbered(n: usize) -> String {
+        (1..=n).map(|i| format!("line {i}\n")).collect()
+    }
+
+    #[test]
+    fn a_small_file_is_returned_exactly_as_it_is() {
+        assert_eq!(slice_lines("a\nb\n", None, None).unwrap(), "a\nb\n");
+        assert_eq!(slice_lines("no newline at end", None, None).unwrap(), "no newline at end");
+        assert_eq!(slice_lines("a\r\nb\r\n", None, None).unwrap(), "a\r\nb\r\n");
+        assert_eq!(slice_lines("", None, None).unwrap(), "");
+    }
+
+    #[test]
+    fn a_long_file_is_cut_at_the_line_limit_with_a_note_about_how_to_continue() {
+        let out = slice_lines(&numbered(2500), None, None).unwrap();
+        assert!(out.starts_with("[lines 1-2000 of 2500. Call read_file again with offset=2001 to continue.]\nline 1\n"));
+        assert!(out.ends_with("line 2000\n"));
+    }
+
+    #[test]
+    fn offset_and_limit_pick_a_range() {
+        let out = slice_lines(&numbered(10), Some(4), Some(3)).unwrap();
+        assert_eq!(out, "[lines 4-6 of 10. Call read_file again with offset=7 to continue.]\nline 4\nline 5\nline 6\n");
+        let tail = slice_lines(&numbered(10), Some(9), None).unwrap();
+        assert_eq!(tail, "[lines 9-10 of 10. End of file.]\nline 9\nline 10\n");
+        // offset 0 is treated as the first line
+        assert_eq!(slice_lines(&numbered(2), Some(0), None).unwrap(), numbered(2));
+    }
+
+    #[test]
+    fn an_offset_past_the_end_is_an_error() {
+        assert!(slice_lines(&numbered(3), Some(4), None).unwrap_err().contains("past the end"));
+    }
+
+    #[test]
+    fn a_huge_amount_of_text_is_cut_at_the_character_limit() {
+        let text = "x".repeat(1000) + "\n";
+        let text = text.repeat(300); // 300 lines, ~300k chars
+        let out = slice_lines(&text, None, None).unwrap();
+        assert!(out.len() < READ_MAX_CHARS + 200);
+        assert!(out.contains("Call read_file again with offset="));
+    }
+
+    #[test]
+    fn a_single_enormous_line_is_cut_and_says_so() {
+        let out = slice_lines(&"y".repeat(500_000), None, None).unwrap();
+        assert!(out.starts_with("[lines 1-1 of 1. Line 1 is longer than"));
+        assert!(out.len() < READ_MAX_CHARS + 200);
+        // multi-byte characters are not split
+        assert!(slice_lines(&"é".repeat(500_000), None, None).is_ok());
+    }
+
+    #[test]
+    fn read_lines_refuses_binary_and_non_text_files_and_stays_in_the_project() {
+        let ws = workspace("read-lines");
+        fs::write(format!("{ws}/proj/bin"), [1u8, 0, 2]).unwrap();
+        fs::write(format!("{ws}/proj/latin1"), [0x63u8, 0x61, 0x66, 0xE9]).unwrap();
+        fs::write(format!("{ws}/proj/ok.txt"), "hello\n").unwrap();
+        let read = |p: &str| read_lines(ws.clone(), "proj".into(), p.into(), None, None);
+        assert!(read("bin").unwrap_err().contains("binary"));
+        assert!(read("latin1").unwrap_err().contains("UTF-8"));
+        assert_eq!(read("ok.txt").unwrap(), "hello\n");
+        assert!(read("../outside").is_err());
+    }
+
+    // ----- multi_edit -----
+
+    fn multi(ws: &str, path: &str, edits: &[(&str, &str)]) -> Result<String, String> {
+        let edits = edits.iter().map(|(o, n)| Edit { old_text: o.to_string(), new_text: n.to_string() }).collect();
+        multi_edit(ws.into(), "proj".into(), path.into(), edits)
+    }
+
+    #[test]
+    fn multi_edit_applies_every_edit_in_one_write() {
+        let ws = workspace("multi-ok");
+        let file = format!("{ws}/proj/a.txt");
+        fs::write(&file, "one two three").unwrap();
+        assert!(multi(&ws, "a.txt", &[("one", "1"), ("three", "3")]).is_ok());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "1 two 3");
+    }
+
+    #[test]
+    fn multi_edit_applies_edits_in_order_so_a_later_edit_can_use_an_earlier_one() {
+        let ws = workspace("multi-order");
+        let file = format!("{ws}/proj/a.txt");
+        fs::write(&file, "a").unwrap();
+        multi(&ws, "a.txt", &[("a", "b"), ("b", "c")]).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "c");
+    }
+
+    #[test]
+    fn multi_edit_changes_nothing_if_any_edit_fails() {
+        let ws = workspace("multi-fail");
+        let file = format!("{ws}/proj/a.txt");
+        fs::write(&file, "one two two").unwrap();
+        let missing = multi(&ws, "a.txt", &[("one", "1"), ("four", "4")]).unwrap_err();
+        assert!(missing.starts_with("Edit 2 of 2: old_text was not found"), "{missing}");
+        assert!(missing.ends_with("No edits were applied."));
+        let ambiguous = multi(&ws, "a.txt", &[("one", "1"), ("two", "2")]).unwrap_err();
+        assert!(ambiguous.starts_with("Edit 2 of 2: old_text appears 2 times"), "{ambiguous}");
+        assert!(multi(&ws, "a.txt", &[("one", "1"), ("", "x")]).unwrap_err().contains("must not be empty"));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "one two two");
+    }
+
+    #[test]
+    fn multi_edit_rejects_an_empty_or_huge_list_and_paths_outside_the_project() {
+        let ws = workspace("multi-edge");
+        fs::write(format!("{ws}/proj/a.txt"), "x").unwrap();
+        assert!(multi(&ws, "a.txt", &[]).is_err());
+        let many = vec![("x", "x"); MAX_EDITS + 1];
+        assert!(multi(&ws, "a.txt", &many).unwrap_err().contains("At most"));
+        assert!(multi(&ws, "../a.txt", &[("x", "y")]).is_err());
+    }
+
+    #[test]
+    fn single_edit_errors_keep_their_wording_without_a_position_prefix() {
+        let err = apply_edits("abc", &[Edit { old_text: "z".into(), new_text: "y".into() }]).unwrap_err();
+        assert!(err.starts_with("old_text was not found"));
+    }
+
+    #[test]
+    fn command_output_limits_can_be_changed() {
+        assert_eq!(shorten("abcdefghij", 2, 3), "ab\n[... 5 characters omitted ...]\nhij");
+        assert_eq!(shorten("abc", 2, 3), "abc");
     }
 }

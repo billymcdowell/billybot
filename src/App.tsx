@@ -76,6 +76,10 @@ import { contextBreakdown } from "./context";
 import { formatInstructions, type ProjectInstructions } from "./instructions";
 import DiffView from "./DiffView";
 import ModelPicker from "./ModelPicker";
+import LimitsPopover from "./LimitsPopover";
+import { DEFAULT_LIMITS, resolveLimits, type Limits } from "./limits";
+import MultiEditDiff from "./MultiEditDiff";
+import ThemeToggle from "./ThemeToggle";
 import { fetchToolModels } from "./models";
 import MessageList from "./Messages";
 import { polish, startRecording, transcribe, type Recording } from "./dictation";
@@ -138,6 +142,7 @@ export default function App() {
   const abortRef = useRef<AbortController | null>(null);
   const [dictation, setDictation] = useState<"idle" | "recording" | "working">("idle");
   const [polishOn, setPolishOn] = useState(true);
+  const [limits, setLimits] = useState<Limits>(DEFAULT_LIMITS);
   const recordingRef = useRef<Promise<Recording> | null>(null);
   const [contextWindow, setContextWindow] = useState<number | null>(null);
   const [instructions, setInstructions] = useState<ProjectInstructions[]>([]); // CLAUDE.md of the open projects
@@ -191,6 +196,7 @@ export default function App() {
     getSetting("model", DEFAULT_MODEL).then(setModel);
     getSetting<Mode>("mode", "ask").then(changeMode);
     getSetting("polish", true).then(setPolishOn);
+    getSetting<Partial<Limits>>("limits", {}).then((l) => setLimits(resolveLimits(l)));
   }, []);
 
   // Load this workspace's chats.
@@ -332,6 +338,7 @@ export default function App() {
           setProjects(p);
         },
         getMode: () => modeRef.current,
+        limits,
         messages: history,
         ask,
         signal: controller.signal,
@@ -555,6 +562,14 @@ export default function App() {
                 }}
               />
               <Label htmlFor="polish">Polish dictation</Label>
+              <LimitsPopover
+                limits={limits}
+                onChange={(l) => {
+                  setLimits(l);
+                  setSetting("limits", l);
+                }}
+              />
+              <ThemeToggle />
             </div>
           </header>
 
@@ -601,7 +616,9 @@ export default function App() {
                         ? `Run a command in ${pending.req.where}?`
                         : pending.req.tool === "edit_file"
                           ? `Edit ${String(pending.req.args.path)}?`
-                          : `Write ${String(pending.req.args.path)}?`}
+                          : pending.req.tool === "multi_edit"
+                            ? `Make ${Array.isArray(pending.req.args.edits) ? pending.req.args.edits.length : "several"} edits to ${String(pending.req.args.path)}?`
+                            : `Write ${String(pending.req.args.path)}?`}
                   </ItemTitle>
                   <ItemDescription>
                     {pending.req.who} · {pending.req.where}
@@ -642,6 +659,11 @@ export default function App() {
                       Runs on your {computerName} as you, starting in {pending.req.where}. The folder lock does not apply to commands:
                       they can reach any file your account can.
                     </p>
+                  </ItemFooter>
+                )}
+                {pending.req.tool === "multi_edit" && (
+                  <ItemFooter>
+                    <MultiEditDiff before={pending.req.before} rawEdits={pending.req.args.edits} />
                   </ItemFooter>
                 )}
                 {pending.req.tool === "edit_file" && (

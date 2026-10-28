@@ -9,6 +9,7 @@ import {
   FolderTreeIcon,
   FolderXIcon,
   ListIcon,
+  SearchIcon,
   TerminalIcon,
   WrenchIcon,
 } from "lucide-react";
@@ -46,6 +47,9 @@ const TOOLS: Record<string, { icon: ElementType; done: string; running: string }
   read_file: { icon: FileTextIcon, done: "Read", running: "Reading" },
   write_file: { icon: FilePenIcon, done: "Wrote", running: "Writing" },
   edit_file: { icon: FilePenIcon, done: "Edited", running: "Editing" },
+  multi_edit: { icon: FilePenIcon, done: "Edited", running: "Editing" },
+  grep: { icon: SearchIcon, done: "Searched", running: "Searching" },
+  glob: { icon: SearchIcon, done: "Found files in", running: "Finding files in" },
   run_command: { icon: TerminalIcon, done: "Ran", running: "Running" },
   list_projects: { icon: ListIcon, done: "Listed projects", running: "Listing projects" },
   open_project: { icon: FolderOpenIcon, done: "Opened", running: "Opening" },
@@ -78,11 +82,18 @@ function resultsOf(messages: Msg[]) {
   return results;
 }
 
+/** What a call acted on, for its line: a path, a project name, a command, or a search and where. */
+function targetOf(call: Call) {
+  const { path, name, command, pattern } = call.args;
+  if (call.name === "grep" || call.name === "glob") return `${String(path ?? "")} for ${String(pattern ?? "")}`;
+  return String(path ?? name ?? command ?? "");
+}
+
 /** The Tool pattern: one Trace line per call; open it to see the output. */
 function ToolLine({ call, result }: { call: Call; result?: string }) {
   const tool = TOOLS[call.name] ?? { icon: WrenchIcon, done: `Ran ${call.name}`, running: `Running ${call.name}` };
   const Icon = tool.icon;
-  const target = String(call.args.path ?? call.args.name ?? call.args.command ?? "");
+  const target = targetOf(call);
   const failed = result !== undefined && isFailure(result);
   const title =
     result === undefined ? `${tool.running} ${target}…` : `${failed ? "Failed: " : ""}${tool.done} ${target}`;

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { resolveLimits } from "../limits";
 import { isWindows } from "../platform";
 import { need, openProjectForCommand } from "./access";
 import { fn } from "./define";
@@ -18,7 +19,7 @@ export const shellTools: Tool[] = [
       {
         project: { type: "string", description: "The open, writable project to run the command in." },
         command: { type: "string" },
-        timeout_seconds: { type: "number", description: "Optional time limit. Default 60, at most 300." },
+        timeout_seconds: { type: "number", description: "Optional time limit in seconds. The app has a default and a maximum, so ask for more only for long builds or test runs." },
       },
       ["project", "command"],
     ),
@@ -27,12 +28,17 @@ export const shellTools: Tool[] = [
     parallelSafe: false,
     subagentRefusal: "Subagents cannot run commands.",
     target: (args, o) => openProjectForCommand(String(args.project ?? ""), o),
-    run: (args, t, { o }) =>
-      invoke<string>("run_command", {
+    run: (args, t, { o }) => {
+      const limits = resolveLimits(o.limits);
+      return invoke<string>("run_command", {
         workspace: o.workspace,
         project: need(t).project,
         command: String(args.command ?? ""),
-        timeoutSeconds: typeof args.timeout_seconds === "number" ? args.timeout_seconds : undefined,
-      }),
+        timeoutSeconds: typeof args.timeout_seconds === "number" ? args.timeout_seconds : limits.defaultTimeoutSecs,
+        maxTimeoutSeconds: limits.maxTimeoutSecs,
+        headChars: limits.outputHeadChars,
+        tailChars: limits.outputTailChars,
+      });
+    },
   },
 ];

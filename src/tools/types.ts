@@ -1,4 +1,5 @@
 import type { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/chat/completions";
+import type { Limits } from "../limits";
 import type { AskFn, ToolCategory } from "../permissions";
 import type { Mode, OpenProject, SubagentRun } from "../storage";
 
@@ -18,6 +19,7 @@ export type AgentOptions = {
   // Token counts the API reports for each request (main agent only).
   onUsage?: (usage: { promptTokens: number; completionTokens: number }) => void;
   signal?: AbortSignal;
+  limits?: Partial<Limits>; // see src/limits.ts; missing values use the defaults
   role?: AgentRole;
   who?: string; // shown on approval cards
 };

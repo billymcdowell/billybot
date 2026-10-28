@@ -20,7 +20,7 @@ describe("tool registry", () => {
 
   it("only marks tools parallel-safe when they are read-only and never prompt", () => {
     const safe = TOOLS.filter((t) => t.parallelSafe).map((t) => t.name);
-    expect(safe).toEqual(["list_projects", "list_dir", "read_file"]);
+    expect(safe).toEqual(["list_projects", "list_dir", "read_file", "grep", "glob"]);
     for (const t of TOOLS.filter((t) => t.parallelSafe)) expect(t.category).toBe("read");
   });
 

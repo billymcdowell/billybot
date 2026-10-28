@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { fn } from "./define";
 import { need, openProjectFor, pp } from "./access";
+import { parseEdits } from "../edits";
 import type { Tool, ToolArgs } from "./types";
 
 const path = {
@@ -25,12 +26,27 @@ export const fileTools: Tool[] = [
   },
   {
     name: "read_file",
-    definition: fn("read_file", "Read a text file.", { path }, ["path"]),
+    definition: fn(
+      "read_file",
+      "Read a text file. Long files are cut off with a note saying which lines you got; call again with offset to read on.",
+      {
+        path,
+        offset: { type: "number", description: "Line to start at, counting from 1. Default 1." },
+        limit: { type: "number", description: "Most lines to return. Default and maximum 2000." },
+      },
+      ["path"],
+    ),
     category: "read",
     roles: ["main", "sub"],
     parallelSafe: true,
     target: (args, o) => openProjectFor(false, filePath(args), o),
-    run: (_args, t, { o }) => invoke<string>("read_file", { workspace: o.workspace, ...pp(need(t)) }),
+    run: (args, t, { o }) =>
+      invoke<string>("read_lines", {
+        workspace: o.workspace,
+        ...pp(need(t)),
+        offset: typeof args.offset === "number" ? args.offset : undefined,
+        limit: typeof args.limit === "number" ? args.limit : undefined,
+      }),
   },
   {
     name: "write_file",
@@ -72,5 +88,38 @@ export const fileTools: Tool[] = [
         oldText: String(args.old_text ?? ""),
         newText: String(args.new_text ?? ""),
       }),
+  },
+  {
+    name: "multi_edit",
+    definition: fn(
+      "multi_edit",
+      "Make several changes to one existing file in a single step. Edits are applied in order, each to the result of the one before, and each old_text must match exactly once. If any edit fails, none are applied. Prefer this to repeated edit_file calls on the same file. The project must be open as writable.",
+      {
+        path,
+        edits: {
+          type: "array",
+          description: "The changes, in the order to apply them.",
+          items: {
+            type: "object",
+            properties: {
+              old_text: { type: "string", description: "The exact text to replace." },
+              new_text: { type: "string", description: "What to put in its place." },
+            },
+            required: ["old_text", "new_text"],
+          },
+        },
+      },
+      ["path", "edits"],
+    ),
+    category: "write",
+    roles: ["main", "sub"],
+    parallelSafe: false,
+    target: (args, o) => {
+      parseEdits(args.edits); // a malformed call is the model's mistake: say so before asking the user anything
+      return openProjectFor(true, filePath(args), o);
+    },
+    preview: (_args, t, o) => invoke<string>("read_file", { workspace: o.workspace, ...pp(need(t)) }).catch(() => null),
+    run: (args, t, { o }) =>
+      invoke<string>("multi_edit", { workspace: o.workspace, ...pp(need(t)), edits: parseEdits(args.edits) }),
   },
 ];

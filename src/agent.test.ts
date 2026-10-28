@@ -64,11 +64,11 @@ describe("toolsFor", () => {
   it("gives the main agent every tool, in a stable order", () => {
     expect(names("main")).toEqual([
       "list_projects", "open_project", "close_project", "create_project", "delegate_task",
-      "run_command", "list_dir", "read_file", "write_file", "edit_file",
+      "run_command", "list_dir", "read_file", "write_file", "edit_file", "multi_edit", "grep", "glob",
     ]);
   });
-  it("gives subagents only the file tools", () => {
-    expect(names("sub")).toEqual(["list_dir", "read_file", "write_file", "edit_file"]);
+  it("gives subagents only the file and search tools", () => {
+    expect(names("sub")).toEqual(["list_dir", "read_file", "write_file", "edit_file", "multi_edit", "grep", "glob"]);
   });
 });
 
@@ -99,14 +99,14 @@ describe("runAgent", () => {
   it("sends the system prompt first and the tool definitions", async () => {
     await run([say("ok")]);
     expect(client.requests[0].messages[0].role).toBe("system");
-    expect(client.requests[0].tools).toHaveLength(10);
+    expect(client.requests[0].tools).toHaveLength(13);
   });
 
   it("runs a tool and sends its result back", async () => {
-    backend({ read_file: () => "file text" });
+    backend({ read_lines: () => "file text" });
     const out = await run([useTools(call("read_file", { path: "app/a.txt" }, "c1")), say("done")]);
     expect(out[out.length - 2]).toEqual({ role: "tool", tool_call_id: "c1", content: "file text" });
-    expect(invokeMock).toHaveBeenCalledWith("read_file", { workspace: "/ws", project: "app", path: "a.txt" });
+    expect(invokeMock).toHaveBeenCalledWith("read_lines", { workspace: "/ws", project: "app", path: "a.txt", offset: undefined, limit: undefined });
   });
 
   it("explains a path outside the open projects", async () => {
@@ -186,7 +186,7 @@ describe("runAgent", () => {
   });
 
   it("cuts an enormous tool result down before it reaches the model", async () => {
-    backend({ read_file: ({ path }) => { if (path === "CLAUDE.md") throw new Error("none"); return "z".repeat(500_000); } });
+    backend({ read_lines: () => "z".repeat(500_000) });
     const out = await run([useTools(call("read_file", { path: "app/big.txt" })), say("ok")]);
     const [result] = toolResults(out);
     expect(result.length).toBeLessThan(101_000);
@@ -230,7 +230,10 @@ describe("runAgent", () => {
     backend({ run_command: () => "output" });
     const out = await run([useTools(call("run_command", { project: "app", command: "ls", timeout_seconds: 5 })), say("ok")]);
     expect(toolResults(out)[0]).toBe("output");
-    expect(invokeMock).toHaveBeenCalledWith("run_command", { workspace: "/ws", project: "app", command: "ls", timeoutSeconds: 5 });
+    expect(invokeMock).toHaveBeenCalledWith("run_command", {
+      workspace: "/ws", project: "app", command: "ls", timeoutSeconds: 5,
+      maxTimeoutSeconds: 300, headChars: 10_000, tailChars: 20_000,
+    });
   });
 
   it("runs delegated tasks and caps them at three per turn", async () => {
@@ -252,5 +255,95 @@ describe("runAgent", () => {
     backend({ read_file: ({ path }) => { if (path === "CLAUDE.md") return "use tabs"; throw new Error("x"); } });
     await run([say("ok")]);
     expect(String(client.requests[0].messages[0].content)).toContain("use tabs");
+  });
+});
+
+describe("file and search tools", () => {
+  it("passes read_file's offset and limit through, ignoring values that aren't numbers", async () => {
+    backend({ read_lines: () => "x" });
+    await run([useTools(call("read_file", { path: "app/a.txt", offset: 50, limit: "lots" })), say("ok")]);
+    expect(invokeMock).toHaveBeenCalledWith("read_lines", { workspace: "/ws", project: "app", path: "a.txt", offset: 50, limit: undefined });
+  });
+
+  it("sends grep's options to Rust and treats it as a read: no prompt, even read-only", async () => {
+    backend({ grep_files: () => "app/a.ts:1: hit" });
+    const { ask } = recordingAsk();
+    const out = await run(
+      [useTools(call("grep", { pattern: "hit", path: "app/src", glob: "*.ts", case_insensitive: true, context: 2, output: "files", max_results: 5 })), say("ok")],
+      { ask, projects: [{ name: "app", writable: false }] },
+      "readOnly",
+    );
+    expect(toolResults(out)[0]).toBe("app/a.ts:1: hit");
+    expect(ask).not.toHaveBeenCalled();
+    expect(invokeMock).toHaveBeenCalledWith("grep_files", {
+      workspace: "/ws", project: "app", path: "src", pattern: "hit", glob: "*.ts",
+      caseInsensitive: true, context: 2, output: "files", maxResults: 5,
+    });
+  });
+
+  it("sends glob's options to Rust and keeps it inside open projects", async () => {
+    backend({ glob_files: () => "app/a.ts" });
+    const out = await run([useTools(call("glob", { pattern: "*.ts", path: "app" }, "g1"), call("glob", { pattern: "*", path: "other" }, "g2")), say("ok")]);
+    expect(invokeMock).toHaveBeenCalledWith("glob_files", { workspace: "/ws", project: "app", path: "", pattern: "*.ts", maxResults: undefined });
+    expect(toolResults(out)[1]).toMatch(/^Error: "other" is not open/);
+  });
+
+  it("lets subagents search", async () => {
+    backend({ grep_files: () => "No matches." });
+    const replies = [useTools(call("grep", { pattern: "x", path: "app" })), say("ok")];
+    client = fakeClient([], () => replies.shift()!);
+    const out = await runAgent(options({ role: "sub", who: "app agent" }));
+    expect(toolResults(out)).toEqual(["No matches."]);
+  });
+
+  it("applies a multi_edit as one write after one approval", async () => {
+    backend({ read_file: () => "one two", multi_edit: () => "Made 2 edits to app/a.txt" });
+    const { ask, asked } = recordingAsk("once");
+    const edits = [{ old_text: "one", new_text: "1" }, { old_text: "two", new_text: "2" }];
+    const out = await run([useTools(call("multi_edit", { path: "app/a.txt", edits })), say("ok")], { ask }, "ask");
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toMatchObject({ tool: "multi_edit", category: "write", before: "one two" });
+    expect(invokeMock).toHaveBeenCalledWith("multi_edit", { workspace: "/ws", project: "app", path: "a.txt", edits });
+    expect(toolResults(out)[0]).toBe("Made 2 edits to app/a.txt");
+  });
+
+  it("rejects a malformed multi_edit before asking the user anything", async () => {
+    const { ask } = recordingAsk();
+    const out = await run(
+      [useTools(call("multi_edit", { path: "app/a.txt", edits: [{ old_text: "a" }] }, "m1"), call("multi_edit", { path: "app/a.txt", edits: [] }, "m2")), say("ok")],
+      { ask },
+      "ask",
+    );
+    expect(ask).not.toHaveBeenCalled();
+    expect(toolResults(out)).toEqual([
+      "Error: Edit 1 of 1 must have old_text and new_text as text.",
+      "Error: edits must be a non-empty list of {old_text, new_text}.",
+    ]);
+  });
+
+  it("refuses multi_edit in a read-only project and in read-only mode", async () => {
+    const edits = [{ old_text: "a", new_text: "b" }];
+    const ro = await run([useTools(call("multi_edit", { path: "app/a", edits })), say("ok")], { projects: [{ name: "app", writable: false }] });
+    expect(toolResults(ro)[0]).toMatch(/open read-only/);
+    const mode = await run([useTools(call("multi_edit", { path: "app/a", edits })), say("ok")], {}, "readOnly");
+    expect(toolResults(mode)[0]).toMatch(/Read-only mode/);
+  });
+});
+
+describe("limits", () => {
+  it("uses the user's command limits", async () => {
+    backend({ run_command: () => "ok" });
+    await run([useTools(call("run_command", { project: "app", command: "ls" })), say("ok")], {
+      limits: { defaultTimeoutSecs: 120, maxTimeoutSecs: 900, outputHeadChars: 1, outputTailChars: 2 },
+    });
+    expect(invokeMock).toHaveBeenCalledWith("run_command", expect.objectContaining({
+      timeoutSeconds: 120, maxTimeoutSeconds: 900, headChars: 1, tailChars: 2,
+    }));
+  });
+
+  it("uses the user's cap on tool results", async () => {
+    backend({ read_lines: () => "q".repeat(20_000) });
+    const out = await run([useTools(call("read_file", { path: "app/a" })), say("ok")], { limits: { maxResultChars: 5_000 } });
+    expect(toolResults(out)[0].length).toBeLessThan(5_300);
   });
 });

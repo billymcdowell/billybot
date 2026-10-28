@@ -6,14 +6,15 @@ A small desktop agent harness built with Tauri, React and TypeScript. Pick a wor
 
 - **Agent loop in the app.** Send the conversation to the model; if it calls a tool, check permission, run it, append the result and repeat until it answers in plain text.
 - **Any tool-capable OpenRouter model**, chosen from a searchable list.
-- **Project-scoped tools:** `list_dir`, `read_file`, `write_file`, `edit_file` and `run_command`, implemented in Rust and confined to the open project folder. Commands can be cancelled.
+- **Project-scoped tools:** `list_dir`, `read_file` (in parts, for long files), `write_file`, `edit_file`, `multi_edit`, `grep`, `glob` and `run_command`, implemented in Rust and confined to the open project folder. Search respects `.gitignore`. Commands can be cancelled.
+- **Limits you can change:** command time limit and output size, and the largest tool result, from the sliders icon in the header.
 - **Workspace and subagents:** the agent can list, open, create and close projects inside one workspace folder and delegate tasks to subagents.
 - **Permissions and diffs:** file changes are shown as diffs and need your approval according to your settings.
 - **Project instructions:** each open project's `CLAUDE.md` is loaded into the agent's instructions.
 - **Context meter** with a per-category usage breakdown.
 - **Markdown replies** (links open externally, images are blocked).
 - **Local dictation** with Whisper (optional, see below).
-- **UI** built with shadcn/ui.
+- **UI** built with shadcn/ui, with a System / Light / Dark theme toggle.
 
 ## Requirements
 
