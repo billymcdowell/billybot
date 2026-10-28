@@ -40,6 +40,7 @@ export type Conversation = {
   budgetExtra?: number; // dollars added to this chat's cap after it ran out
   forkedFrom?: { chatId: string; messageIndex: number }; // set on a chat made with "Fork from here"
   checkpoints?: { run: string; turn: number }[]; // each run that may have changed files, and the turn it answered
+  mode?: Mode; // this chat's permission mode; chats saved before modes were per chat have none
 };
 
 /** What the sidebar needs about a chat, kept in an index so listing never opens every chat. */

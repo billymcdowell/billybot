@@ -14,7 +14,17 @@
       {
         "title": "billybot",
         "width": 1100,
-        "height": 750
+        "height": 750,
+        "label": "main",
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "decorations": true,
+        "trafficLightPosition": { "x": 18, "y": 22 },
+        "transparent": true,
+        "windowEffects": {
+          "effects": ["sidebar"],
+          "state": "followsWindowActiveState"
+        }
       }
     ],
     "security": {

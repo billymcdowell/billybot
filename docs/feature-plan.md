@@ -217,6 +217,25 @@ A live log of everything the app and agent are doing, in a panel docked on the r
 
 ## Phase 4: Agent behaviours
 
+### 7.0 Concurrent chats (XL, built first, as its own step: 7a)
+You can start an agent in one chat and go on to do something else in the app: read another chat, start another agent there, change settings. You never have to sit and watch. Today that is impossible by design: `App.tsx` holds one set of state (messages, busy, approvals, usage, events, queue, undo runs) for "the chat on screen", the sidebar is disabled while `busy`, and **Stop kills every running command in the app**.
+
+**The change:** move a chat's live state and its run out of the React component into a **session store** (`src/sessions.ts`), one session per chat that has been opened or started. A session owns what `App.tsx` owns for the open chat today: messages, projects, subagent runs, streaming text, approvals, queue, usage, activity events, undo runs, error, abort controller, mode, draft text. The run loop (`run`, `continueRun`, `regenerate`, saving as it goes, cost, budget, steering) moves with it. `App.tsx` shows the session you are looking at and nothing else; switching chats just changes which session it shows. A run keeps going whichever chat is on screen. `runAgent` already takes everything through callbacks and keeps no global state, so this is mostly moving code, plus the points below.
+
+**What has to change for this to be safe:**
+- **Stop is per chat.** `run_command` takes a run id and `cancel_commands` cancels only that run's commands (today it cancels all). "Stop all" is a separate button when more than one chat is running.
+- **Approvals belong to a chat.** A background agent that needs approval simply waits (as it does now). The sidebar marks that chat "needs you"; opening it shows the approval card as usual. A badge in the header counts chats waiting on you.
+- **Mode is per chat** (starts from your default and is saved with the chat). A global mode would let changing it for one chat silently change a different chat's running agent.
+- **Sidebar status per chat:** running (spinner), needs you (dot), finished while you were away (check, until you open it), failed or stopped. You can open, rename, pin and fork any chat at any time. A chat that is running can't be deleted until stopped.
+- **Two chats in one project.** Both can edit the same files, so the app warns when you start a run in a project another chat is working in (a note on the chat and an entry in the activity log). It does not lock. Undo copies are per run, so each run's undo still works, and files changed by the other chat since are reported as conflicts, never overwritten silently.
+- **Branch per chat** only makes a branch when no other chat is running in that project, because switching branches changes the files under the other agent. Otherwise it skips with a note. (Separate working folders per chat, using git worktrees, is the real fix and is a later step.)
+- **A cap on running chats** (default 4, set in Limits). Past it, a new run waits in line, and the chat says "Waiting for a free slot". This keeps one person's burst from hitting OpenRouter's rate limits.
+- **Leaving.** Quitting or closing the window while agents are working asks first ("2 agents are still working. Quit anyway?"). Switching workspace while agents are working asks too.
+- **Drafts are per chat**, so a half-typed message isn't carried into another chat.
+- **Optional notifications** when a chat finishes or needs you while the app is in the background (a system notification through Tauri's notification plugin). Off by default.
+
+**Tests:** two sessions running at once with independent messages, usage, events and queues; an approval in a background session doesn't appear in the one on screen and is answered from its own; Stop in one leaves the other running (including its commands, in Rust); the run cap queues and releases in order; closing with agents running asks; saving never mixes chats; per-chat mode is respected mid-run. The run logic becomes testable outside React for the first time.
+
 ### 7. Todo tool (S–M)
 - `todo_write({items: [{content, status}]})` replaces the whole list (simple and hard to corrupt). Stored in `Conversation.todos`, not just in memory.
 - Category `meta`: no permission prompt. Main agent only.
@@ -267,7 +286,8 @@ A live log of everything the app and agent are doing, in a panel docked on the r
 | 4 | 28, 25, 26, 27, 30 | Needs the new storage; 28 early because 10 and 11 need it |
 | 5 | 16, 22, 19, 23 | Safety layer on the registry |
 | 6 | 17, 18 | Biggest safety value, biggest build; 17 before 26's revert prompt gets wired |
-| 7 | 7, 8, 9, 10 | Agent behaviours |
+| 7a | 7.0 | Concurrent chats: run agents in the background, switch chats freely (own commit; the others build on it) |
+| 7b | 7, 8, 9, 10 | Agent behaviours: todo, ask-the-user, parallel reads, live subagent transcripts |
 | 8 | 11, 5, 6, 20 | Largest or most uncertain pieces last |
 
 Items within a step that don't touch the same files (for example 37 and 1) can be built in parallel by separate people or sessions. Steps 3 and 4 share `App.tsx` and `storage.ts`, so do those in sequence.

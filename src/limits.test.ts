@@ -36,3 +36,12 @@ describe("undo copy limits", () => {
     expect(resolveLimits({ checkpointDays: 9999, checkpointMb: 999_999 })).toMatchObject({ checkpointDays: 365, checkpointMb: 20_000 });
   });
 });
+
+describe("running chats at once", () => {
+  it("defaults to 4 and stays between 1 and 16", () => {
+    expect(DEFAULT_LIMITS.maxConcurrentRuns).toBe(4);
+    expect(resolveLimits({ maxConcurrentRuns: 0 }).maxConcurrentRuns).toBe(1);
+    expect(resolveLimits({ maxConcurrentRuns: 99 }).maxConcurrentRuns).toBe(16);
+    expect(resolveLimits({ maxConcurrentRuns: 2.6 }).maxConcurrentRuns).toBe(3);
+  });
+});

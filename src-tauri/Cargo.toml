@@ -29,6 +29,7 @@ keyring = "4"
 whisper-rs = "0.16"
 ignore = "0.4"
 regex = "1"
+tauri-plugin-notification = "2"
 
 # Metal is Apple-only; enabling it elsewhere makes CMake look for Apple frameworks.
 [target.'cfg(target_os = "macos")'.dependencies]

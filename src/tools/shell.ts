@@ -49,6 +49,7 @@ export const shellTools: Tool[] = [
         maxTimeoutSeconds: limits.maxTimeoutSecs,
         headChars: limits.outputHeadChars,
         tailChars: limits.outputTailChars,
+        runId: o.runKey,
       });
     },
   },

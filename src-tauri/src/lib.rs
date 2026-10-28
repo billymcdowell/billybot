@@ -588,9 +588,24 @@ fn shorten(text: &str, head_chars: usize, tail_chars: usize) -> String {
     format!("{head}\n[... {} characters omitted ...]\n{tail}", chars.len() - head_chars - tail_chars)
 }
 
-/// One flag per command that is running right now. Stop sets them all, and each command's
-/// wait loop notices and kills its own process group.
-static RUNNING: Mutex<Vec<Arc<AtomicBool>>> = Mutex::new(Vec::new());
+/// A cancel flag for each command that is running right now, with the run (one agent working in
+/// one chat) that started it. Stop sets a run's flags, and each command's wait loop notices and
+/// kills its own process group. Commands from other runs are left alone.
+type Running = (Option<String>, Arc<AtomicBool>);
+static RUNNING: Mutex<Vec<Running>> = Mutex::new(Vec::new());
+
+/// Sets the cancel flag of every command belonging to `run_id`, or of all of them if it is None.
+/// Returns how many it cancelled.
+fn cancel_matching(running: &[Running], run_id: Option<&str>) -> usize {
+    let mut cancelled = 0;
+    for (owner, flag) in running {
+        if run_id.is_none() || owner.as_deref() == run_id {
+            flag.store(true, Ordering::SeqCst);
+            cancelled += 1;
+        }
+    }
+    cancelled
+}
 
 /// Runs a command with the project as its starting folder and returns its exit code and
 /// combined output. Nothing is typed into it, and after it finishes, times out or is
@@ -690,6 +705,7 @@ async fn run_command(
     max_timeout_seconds: Option<u64>,
     head_chars: Option<usize>,
     tail_chars: Option<usize>,
+    run_id: Option<String>,
 ) -> Result<String, String> {
     if command.trim().is_empty() {
         return Err("command must not be empty".into());
@@ -702,7 +718,7 @@ async fn run_command(
     let tail = tail_chars.unwrap_or(TAIL_CHARS).min(MAX_KEPT_CHARS);
     // Register a cancel flag so Stop can reach this command while it runs.
     let cancel = Arc::new(AtomicBool::new(false));
-    RUNNING.lock().map_err(|_| "Lock failed")?.push(cancel.clone());
+    RUNNING.lock().map_err(|_| "Lock failed")?.push((run_id, cancel.clone()));
     let flag = cancel.clone();
     // Commands take a while, so run off the main thread.
     let result = tauri::async_runtime::spawn_blocking(move || {
@@ -711,19 +727,17 @@ async fn run_command(
     .await
     .map_err(|e| e.to_string());
     if let Ok(mut running) = RUNNING.lock() {
-        running.retain(|f| !Arc::ptr_eq(f, &cancel));
+        running.retain(|(_, f)| !Arc::ptr_eq(f, &cancel));
     }
     result?
 }
 
-/// Called by the Stop button: cancels every command that is running. Returns how many.
+/// Called by the Stop button: cancels the commands of one run, or of every run if none is named.
+/// Returns how many.
 #[tauri::command]
-fn cancel_commands() -> usize {
+fn cancel_commands(run_id: Option<String>) -> usize {
     let running = RUNNING.lock().map(|r| r.clone()).unwrap_or_default();
-    for flag in &running {
-        flag.store(true, Ordering::SeqCst);
-    }
-    running.len()
+    cancel_matching(&running, run_id.as_deref())
 }
 
 /// Dictation records from the microphone in the webview. WebKitGTK ships with MediaStream off
@@ -761,6 +775,7 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .manage(stt::Stt::default())
         .invoke_handler(tauri::generate_handler![
@@ -1292,5 +1307,39 @@ mod tests {
     fn command_output_limits_can_be_changed() {
         assert_eq!(shorten("abcdefghij", 2, 3), "ab\n[... 5 characters omitted ...]\nhij");
         assert_eq!(shorten("abc", 2, 3), "abc");
+    }
+
+    #[test]
+    fn stopping_one_run_leaves_the_commands_of_other_runs_alone() {
+        let flag = || Arc::new(AtomicBool::new(false));
+        let (a1, a2, b, loose) = (flag(), flag(), flag(), flag());
+        let running: Vec<Running> = vec![
+            (Some("chat-a".into()), a1.clone()),
+            (Some("chat-a".into()), a2.clone()),
+            (Some("chat-b".into()), b.clone()),
+            (None, loose.clone()),
+        ];
+        assert_eq!(cancel_matching(&running, Some("chat-a")), 2);
+        assert!(a1.load(Ordering::SeqCst) && a2.load(Ordering::SeqCst));
+        assert!(!b.load(Ordering::SeqCst) && !loose.load(Ordering::SeqCst));
+        assert_eq!(cancel_matching(&running, Some("nobody")), 0);
+        assert!(!b.load(Ordering::SeqCst));
+        assert_eq!(cancel_matching(&running, None), 4, "no run named: everything");
+        assert!(b.load(Ordering::SeqCst) && loose.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_cancelled_run_stops_its_own_command_but_not_a_neighbours() {
+        let root = project_root(&workspace("two-runs"), "proj").unwrap();
+        let (mine, theirs) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let running: Vec<Running> = vec![(Some("mine".into()), mine.clone()), (Some("theirs".into()), theirs.clone())];
+        let (r1, r2) = (root.clone(), root);
+        let (m, t) = (mine.clone(), theirs.clone());
+        let a = std::thread::spawn(move || run_shell(&r1, &sleep_cmd(30), Duration::from_secs(60), &m));
+        let b = std::thread::spawn(move || run_shell(&r2, &sleep_cmd(1), Duration::from_secs(60), &t));
+        std::thread::sleep(Duration::from_millis(300));
+        cancel_matching(&running, Some("mine"));
+        assert!(a.join().unwrap().unwrap().starts_with("Cancelled"));
+        assert!(b.join().unwrap().unwrap().starts_with("Exit code 0"), "the other run's command finished normally");
     }
 }

@@ -1,4 +1,4 @@
-import { GitForkIcon, MoreHorizontalIcon, PencilIcon, PinIcon, PinOffIcon, SearchIcon, Trash2Icon } from "lucide-react";
+import { CheckIcon, ClockIcon, GitForkIcon, MoreHorizontalIcon, PencilIcon, PinIcon, PinOffIcon, SearchIcon, Trash2Icon } from "lucide-react";
 import { useEffect, useState } from "react";
 import {
   DropdownMenu,
@@ -18,12 +18,15 @@ import {
   SidebarMenuItem,
 } from "@/components/ui/sidebar";
 import { formatCost } from "./cost";
+import { Spinner } from "@/components/ui/spinner";
+import type { SessionSummary } from "./sessions";
 import type { ChatSummary, SearchHit } from "./storage";
 
 type Props = {
   chats: ChatSummary[];
   activeId: string;
-  busy: boolean;
+  /** What each chat is doing right now. Chats not listed are idle. */
+  status: ReadonlyMap<string, SessionSummary>;
   onOpen: (id: string) => void;
   onDelete: (id: string) => void;
   onRename: (id: string, title: string) => void;
@@ -31,8 +34,23 @@ type Props = {
   onSearch: (query: string) => Promise<SearchHit[]>;
 };
 
+/** What a chat is doing, in a glance: working, waiting its turn, waiting on you, or news since you last looked. */
+function StatusMark({ summary }: { summary: SessionSummary | undefined }) {
+  if (!summary) return null;
+  if (summary.needsYou) {
+    return <span className="size-2 shrink-0 rounded-full bg-amber-500" role="img" aria-label="Needs your approval" title="Needs your approval" />;
+  }
+  if (summary.phase === "running") return <Spinner className="size-3 shrink-0" aria-label="Working" />;
+  if (summary.phase === "waiting") return <ClockIcon className="size-3 shrink-0 text-muted-foreground" aria-label="Waiting for a free slot" />;
+  if (summary.attention === "done") return <CheckIcon className="size-3 shrink-0 text-green-600" aria-label="Finished while you were away" />;
+  if (summary.attention === "failed") {
+    return <span className="size-2 shrink-0 rounded-full bg-red-500" role="img" aria-label="Stopped with an error" title="Stopped with an error" />;
+  }
+  return null;
+}
+
 /** The sidebar's chat list: search, rename, pin and delete. */
-export default function ChatList({ chats, activeId, busy, onOpen, onDelete, onRename, onPin, onSearch }: Props) {
+export default function ChatList({ chats, activeId, status, onOpen, onDelete, onRename, onPin, onSearch }: Props) {
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<Map<string, string>>(new Map()); // chat id → text around the match
   const [renaming, setRenaming] = useState<string | null>(null);
@@ -105,13 +123,13 @@ export default function ChatList({ chats, activeId, busy, onOpen, onDelete, onRe
                   <SidebarMenuButton
                     isActive={c.id === activeId}
                     onClick={() => onOpen(c.id)}
-                    disabled={busy}
                     className="h-auto flex-col items-start gap-0"
                   >
                     <span className="flex w-full items-center gap-1">
                       {c.pinned && <PinIcon className="size-3 shrink-0 text-muted-foreground" aria-label="Pinned" />}
                       {c.forked && <GitForkIcon className="size-3 shrink-0 text-muted-foreground" aria-label="Forked" />}
-                      <span className="truncate">{c.title}</span>
+                      <span className="min-w-0 flex-1 truncate">{c.title}</span>
+                      <StatusMark summary={status.get(c.id)} />
                     </span>
                     {(() => {
                       const detail = hits.get(c.id) ?? [c.projects.join(", "), c.cost ? formatCost(c.cost) : ""].filter(Boolean).join(" · ");
@@ -120,7 +138,7 @@ export default function ChatList({ chats, activeId, busy, onOpen, onDelete, onRe
                   </SidebarMenuButton>
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
-                      <SidebarMenuAction showOnHover disabled={busy} aria-label={`Actions for ${c.title}`}>
+                      <SidebarMenuAction showOnHover aria-label={`Actions for ${c.title}`}>
                         <MoreHorizontalIcon />
                       </SidebarMenuAction>
                     </DropdownMenuTrigger>
@@ -132,8 +150,12 @@ export default function ChatList({ chats, activeId, busy, onOpen, onDelete, onRe
                         {c.pinned ? <PinOffIcon /> : <PinIcon />} {c.pinned ? "Unpin" : "Pin"}
                       </DropdownMenuItem>
                       <DropdownMenuSeparator />
-                      <DropdownMenuItem variant="destructive" onSelect={() => onDelete(c.id)}>
-                        <Trash2Icon /> Delete
+                      <DropdownMenuItem
+                        variant="destructive"
+                        disabled={(status.get(c.id)?.phase ?? "idle") !== "idle"}
+                        onSelect={() => onDelete(c.id)}
+                      >
+                        <Trash2Icon /> {(status.get(c.id)?.phase ?? "idle") !== "idle" ? "Delete (stop it first)" : "Delete"}
                       </DropdownMenuItem>
                     </DropdownMenuContent>
                   </DropdownMenu>

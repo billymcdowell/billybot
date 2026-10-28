@@ -14,6 +14,7 @@ const FIELDS: { key: keyof Limits; label: string; unit: string }[] = [
   { key: "outputTailChars", label: "Command output: keep the end", unit: "characters" },
   { key: "maxResultChars", label: "Largest tool result", unit: "characters" },
   { key: "budgetUsd", label: "Budget for each chat (0 = none)", unit: "dollars" },
+  { key: "maxConcurrentRuns", label: "Chats that may work at once", unit: "chats" },
   { key: "checkpointDays", label: "Keep undo copies for", unit: "days" },
   { key: "checkpointMb", label: "Undo copies may take up to", unit: "MB" },
 ];
@@ -25,10 +26,12 @@ type Props = {
   onRedactChange: (on: boolean) => void;
   branchPerChat: boolean;
   onBranchPerChatChange: (on: boolean) => void;
+  notifyOn: boolean;
+  onNotifyChange: (on: boolean) => void;
 };
 
 /** Header menu for the limits in src/limits.ts. A value is applied (and clamped) when you leave its box. */
-export default function LimitsPopover({ limits, onChange, redact, onRedactChange, branchPerChat, onBranchPerChatChange }: Props) {
+export default function LimitsPopover({ limits, onChange, redact, onRedactChange, branchPerChat, onBranchPerChatChange, notifyOn, onNotifyChange }: Props) {
   const [draft, setDraft] = useState<Record<string, string>>({});
   useEffect(() => setDraft({}), [limits]);
 
@@ -81,6 +84,15 @@ export default function LimitsPopover({ limits, onChange, redact, onRedactChange
               <span className="text-xs text-muted-foreground">
                 Keys, tokens and passwords in files and command output are replaced with a placeholder before the model sees them.
                 It catches common formats, not everything.
+              </span>
+            </div>
+          </div>
+          <div className="flex items-start gap-3">
+            <Switch id="notify" checked={notifyOn} onCheckedChange={onNotifyChange} />
+            <div className="flex flex-col gap-0.5">
+              <Label htmlFor="notify">Notify me when a chat finishes or needs me</Label>
+              <span className="text-xs text-muted-foreground">
+                A desktop notification, only while billybot is in the background. The sidebar always shows it.
               </span>
             </div>
           </div>

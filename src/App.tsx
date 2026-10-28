@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
-import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import {
   AlertCircleIcon,
   ActivityIcon,
@@ -79,25 +79,25 @@ import {
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { DEFAULT_MODEL, loadInstructions, runAgent, systemPrompt, toolsFor } from "./agent";
+import { DEFAULT_MODEL, loadInstructions, systemPrompt, toolsFor } from "./agent";
 import { textOf } from "./text";
 import ActivityPanel, { MAX_WIDTH, MIN_WIDTH } from "./ActivityPanel";
-import { makeEvent, mergeEvents, upsertEvent, type ActivityDraft, type ActivityEvent } from "./activity";
+import { type ActivityEvent } from "./activity";
 import { flushActivity, loadChatActivity, saveActivity } from "./auditLog";
 import ChangesDialog from "./ChangesDialog";
 import ChatList from "./ChatList";
 import {
-  changedByTurn, checkpointStatus, describePlan, filesFrom, previewRevert, revertRuns, runsFrom, summarizeRevert,
-  type CheckpointRun, type PlanSummary,
+  checkpointStatus, describePlan, filesFrom, previewRevert, revertRuns, runsFrom,
+  type PlanSummary,
 } from "./checkpoints";
 import CostChip, { budgetStep } from "./CostChip";
 import ContextMeter from "./ContextMeter";
 import { contextBreakdown } from "./context";
-import { addUsage, budgetState, effectiveCap, emptyUsage, formatCost, type ChatUsage } from "./cost";
+import { effectiveCap, formatCost } from "./cost";
 import ExportMenu from "./ExportMenu";
 import { chatToJson, chatToMarkdown, exportFileName } from "./exportChat";
-import { branchName, describeGit, gitCreateBranch, gitStatus, isChatBranch, isShowable, type GitInfo } from "./git";
-import { autoTitle, forkMessages, repairMessages, repairSubagents, runState, type RunState } from "./history";
+import { describeGit, gitCreateBranch, gitStatus, isChatBranch, isShowable, type GitInfo } from "./git";
+import { runState, type RunState } from "./history";
 import { formatInstructions, type ProjectInstructions } from "./instructions";
 import DiffView from "./DiffView";
 import ModelPicker from "./ModelPicker";
@@ -108,9 +108,10 @@ import ThemeToggle from "./ThemeToggle";
 import { fetchToolModels, type ModelInfo } from "./models";
 import MessageList, { type EditingMessage } from "./Messages";
 import { polish, startRecording, transcribe, type Recording } from "./dictation";
-import { MODES, nextMode, type Approval, type ApprovalRequest } from "./permissions";
+import { MODES, nextMode, type Approval } from "./permissions";
 import PermissionsDialog from "./PermissionsDialog";
 import { computerName, isWindows, keyStoreName } from "./platform";
+import { actedIn, blankSession, createController, isBusy, titleOf, useSession, useSummaries } from "./sessions";
 import {
   deleteConversation,
   getSetting,
@@ -121,28 +122,9 @@ import {
   setSetting,
   updateChatMeta,
   type ChatSummary,
-  type Conversation,
   type Mode,
-  type OpenProject,
-  type SubagentRun,
 } from "./storage";
 
-type Pending = { req: ApprovalRequest; resolve: (answer: Approval) => void };
-
-const newId = (): string => crypto.randomUUID();
-
-/** What the open chat remembers besides its messages. */
-type ChatMeta = {
-  title?: string;
-  titleEdited?: boolean;
-  pinned?: boolean;
-  budgetExtra?: number;
-  forkedFrom?: { chatId: string; messageIndex: number };
-};
-/** A message typed while the agent was working. `steering` ones join the run at its next step. */
-type Queued = { id: string; text: string; steering?: boolean };
-// Tools whose effects Regenerate can't take back.
-const ACTING_TOOLS = ["write_file", "edit_file", "multi_edit", "run_command", "create_project"];
 
 const STATE_NOTE: Record<RunState, string> = {
   none: "",
@@ -173,106 +155,125 @@ function Setup(props: { title: string; description: string; error: string; child
   );
 }
 
-type RunOptions = {
-  id?: string; // the chat to save into; defaults to the open one
-  meta?: ChatMeta;
-  subagents?: Record<string, SubagentRun>;
-  usage?: ChatUsage;
-};
-
-/** Everything a saved chat holds. */
-function buildConversation(p: {
-  id: string;
-  meta: ChatMeta;
-  messages: ChatCompletionMessageParam[];
-  projects: OpenProject[];
-  subagents: Record<string, SubagentRun>;
-  usage: ChatUsage;
-  stopped: boolean;
-  checkpoints: CheckpointRun[];
-}): Conversation {
-  return {
-    id: p.id,
-    title: p.meta.titleEdited && p.meta.title ? p.meta.title : autoTitle(p.messages),
-    titleEdited: p.meta.titleEdited,
-    pinned: p.meta.pinned,
-    updatedAt: Date.now(),
-    messages: p.messages,
-    projects: p.projects,
-    subagents: p.subagents,
-    stopped: p.stopped,
-    usage: p.usage,
-    budgetExtra: p.meta.budgetExtra,
-    forkedFrom: p.meta.forkedFrom,
-    checkpoints: p.checkpoints,
-  };
+/** A desktop notification, when the app is in the background and you've asked for them. */
+async function sendDesktopNotification(title: string, body: string) {
+  try {
+    const { isPermissionGranted, requestPermission, sendNotification } = await import("@tauri-apps/plugin-notification");
+    if (!(await isPermissionGranted()) && (await requestPermission()) !== "granted") return;
+    sendNotification({ title, body });
+  } catch {
+    // no notifications here: the sidebar still shows the news
+  }
 }
 
-/** True if the agent changed files or ran commands in these messages. */
-const actedIn = (msgs: ChatCompletionMessageParam[]) =>
-  msgs.some(
-    (m) => m.role === "assistant" && m.tool_calls?.some((c) => c.type === "function" && ACTING_TOOLS.includes(c.function.name)),
-  );
+// What the controller reads. App keeps these up to date on every render; the chats themselves
+// don't live in React, so a run carries on whichever chat is on screen.
+const live = {
+  current: {
+    apiKey: null as string | null,
+    workspace: null as string | null,
+    model: DEFAULT_MODEL,
+    limits: DEFAULT_LIMITS,
+    redact: true,
+    branchPerChat: false,
+    defaultMode: "ask" as Mode,
+    notifyOn: false,
+  },
+};
+const models: { current: ModelInfo[] } = { current: [] };
+const actions = { refreshChats: () => {}, refreshGit: (_names?: string[]) => {} };
+
+const ctl = createController({
+  workspace: () => live.current.workspace,
+  apiKey: () => live.current.apiKey,
+  model: () => live.current.model,
+  limits: () => live.current.limits,
+  redact: () => live.current.redact,
+  branchPerChat: () => live.current.branchPerChat,
+  defaultMode: () => live.current.defaultMode,
+  modelInfo: (id) => models.current.find((m) => m.id === id),
+  saveChat: saveConversation,
+  saveActivity,
+  loadActivity: loadChatActivity,
+  chatsChanged: () => actions.refreshChats(),
+  gitStatus,
+  gitCreateBranch,
+  gitChanged: (names) => actions.refreshGit(names),
+  checkpointStatus,
+  revertRuns,
+  cancelCommands: (runId) => void invoke("cancel_commands", { runId }).catch(() => {}),
+  notify: (title, body) => {
+    if (live.current.notifyOn && !document.hasFocus()) void sendDesktopNotification(title, body);
+  },
+});
+const firstChat = ctl.create().id;
+ctl.activate(firstChat);
 
 export default function App() {
   const [apiKey, setApiKey] = useState<string | null | undefined>(undefined); // undefined = loading
   const [keyInput, setKeyInput] = useState("");
   const [workspace, setWorkspace] = useState<string | null | undefined>(undefined);
   const [model, setModel] = useState(DEFAULT_MODEL);
-  const [mode, setMode] = useState<Mode>("ask");
-  const modeRef = useRef<Mode>("ask");
+  const [defaultMode, setDefaultMode] = useState<Mode>("ask"); // what a new chat starts in
   const [chats, setChats] = useState<ChatSummary[]>([]);
-  const [chatId, setChatId] = useState(newId);
-  const chatIdRef = useRef(chatId); // the chat on screen, for code that outlives a render
-  // What the open chat remembers besides its messages: a name the user chose, and whether it is pinned.
-  const [chatMeta, setChatMeta] = useState<ChatMeta>({});
-  const [usage, setUsage] = useState<ChatUsage>(emptyUsage());
-  const usageRef = useRef<ChatUsage>(emptyUsage()); // read by the running agent, which outlives any one render
-  const modelsRef = useRef<ModelInfo[]>([]); // for prices, when OpenRouter doesn't report a cost
-  const [queue, setQueue] = useState<Queued[]>([]); // messages typed while the agent was working
-  const queueRef = useRef<Queued[]>([]);
+  const [appError, setAppError] = useState(""); // trouble with the key or workspace, before any chat
+  const [chatId, setChatId] = useState(firstChat); // the chat on screen
+  const [polishOn, setPolishOn] = useState(true);
+  const [limits, setLimits] = useState<Limits>(DEFAULT_LIMITS);
+  const [limitsReady, setLimitsReady] = useState(false);
+  const [redactOn, setRedactOn] = useState(true); // hide secrets from the model
+  const [branchPerChat, setBranchPerChat] = useState(false); // put each chat's changes on their own git branch
+  const [notifyOn, setNotifyOn] = useState(false); // tell me when a chat finishes or needs me while the app is in the background
+  const [contextWindow, setContextWindow] = useState<number | null>(null);
+  const [instructions, setInstructions] = useState<ProjectInstructions[]>([]); // CLAUDE.md of the open projects
   const [editing, setEditing] = useState<EditingMessage | null>(null);
   const [editChoice, setEditChoice] = useState<EditingMessage | null>(null); // asks: fork or replace?
-  const [closedMidRun, setClosedMidRun] = useState(false); // the open chat was cut off by the app closing
   const [fullOutput, setFullOutput] = useState(false); // exports: keep whole tool results
-  const [notice, setNotice] = useState("");
   const [permissionsOpen, setPermissionsOpen] = useState(false);
-  // Runs that may have changed files (Rust keeps undo copies of them), and how many files each turn changed.
-  const [checkpointRuns, setCheckpointRuns] = useState<CheckpointRun[]>([]);
-  const checkpointRunsRef = useRef<CheckpointRun[]>([]);
-  const [changed, setChanged] = useState<Record<string, number>>({});
   const [revertPlan, setRevertPlan] = useState<{ runIds: string[]; summary: PlanSummary } | null>(null);
   const [regenChoice, setRegenChoice] = useState<number | null>(null); // index of the message being answered again
   const [undoDiscarded, setUndoDiscarded] = useState(true); // the checkbox on the regenerate and edit dialogs
-  const [limitsReady, setLimitsReady] = useState(false);
   const [gitInfo, setGitInfo] = useState<Record<string, GitInfo>>({}); // by project name
   const [changesFor, setChangesFor] = useState<string | null>(null); // the project whose Changes dialog is open
-  const [branchPerChat, setBranchPerChat] = useState(false); // put each chat's changes on their own git branch
-  const branchedRef = useRef(new Set<string>()); // "chat:project" pairs already handled this session
-  const [events, setEvents] = useState<ActivityEvent[]>([]); // the activity log for the chat on screen
-  const eventsRef = useRef<ActivityEvent[]>([]);
   const [activityOpen, setActivityOpen] = useState(false);
   const [activityWidth, setActivityWidth] = useState(420);
-  const warnedRef = useRef({ context: new Set<number>(), budget: false }); // each warning is logged once per chat
-  const [stopped, setStopped] = useState(false); // the last run ended because Stop was pressed
-  const [messages, setMessages] = useState<ChatCompletionMessageParam[]>([]);
-  const [projects, setProjects] = useState<OpenProject[]>([]);
-  const [subagents, setSubagents] = useState<Record<string, SubagentRun>>({});
-  const [streaming, setStreaming] = useState("");
-  const [input, setInput] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [approvals, setApprovals] = useState<Pending[]>([]); // a queue: subagents may ask at once
-  const [error, setError] = useState("");
-  const abortRef = useRef<AbortController | null>(null);
   const [dictation, setDictation] = useState<"idle" | "recording" | "working">("idle");
-  const [polishOn, setPolishOn] = useState(true);
-  const [limits, setLimits] = useState<Limits>(DEFAULT_LIMITS);
-  const [redactOn, setRedactOn] = useState(true); // hide secrets from the model
   const recordingRef = useRef<Promise<Recording> | null>(null);
-  const [contextWindow, setContextWindow] = useState<number | null>(null);
-  const [instructions, setInstructions] = useState<ProjectInstructions[]>([]); // CLAUDE.md of the open projects
+  const dictationChat = useRef(chatId); // where dictated text goes: the chat you were in when you started
+
+  // The chat on screen, and a short summary of every chat for the sidebar.
+  const s = useSession(ctl.store, chatId) ?? blankSession(chatId, defaultMode, 0);
+  const summaries = useSummaries(ctl.store);
+  const { messages, projects, subagents, streaming, usage, events, queue, approvals, notice, stopped, closedMidRun, lastUsage, changed } = s;
+  const error = s.error;
+  const busy = isBusy(s);
   const state = runState(messages, stopped);
-  const cap = effectiveCap(limits.budgetUsd, chatMeta.budgetExtra); // this chat's spending limit; 0 = none
+  const cap = effectiveCap(limits.budgetUsd, s.meta.budgetExtra); // this chat's spending limit; 0 = none
+  const pending = approvals[0];
+
+  const waitingOnYou = [...summaries].filter(([, v]) => v.needsYou).map(([id]) => id);
+  const workingCount = [...summaries].filter(([, v]) => v.phase !== "idle").length;
+
+  live.current = { apiKey: apiKey ?? null, workspace: workspace ?? null, model, limits, redact: redactOn, branchPerChat, defaultMode, notifyOn };
+
+  /** Looks at each open project's git state for the badges in the header. */
+  async function refreshGit(names: string[] = projects.map((p) => p.name)) {
+    if (!workspace) return;
+    const entries = await Promise.all(names.map(async (name) => [name, await gitStatus(workspace, name).catch(() => undefined)] as const));
+    setGitInfo((old) => {
+      const next = { ...old };
+      for (const [name, info] of entries) {
+        if (info) next[name] = info;
+        else delete next[name];
+      }
+      return next;
+    });
+  }
+  actions.refreshChats = () => {
+    const ws = live.current.workspace;
+    if (ws) void listChats(ws).then(setChats);
+  };
+  actions.refreshGit = (names) => void refreshGit(names);
 
   // Look for a CLAUDE.md in each open project, so you can see which ones the agent is following.
   useEffect(() => {
@@ -283,7 +284,6 @@ export default function App() {
       current = false;
     };
   }, [workspace, projects]);
-  const [lastUsage, setLastUsage] = useState<{ promptTokens: number; completionTokens: number } | null>(null);
 
   // The selected model's context size comes from OpenRouter's model list (fetched once and cached).
   useEffect(() => {
@@ -291,7 +291,7 @@ export default function App() {
     let current = true;
     fetchToolModels(apiKey)
       .then((list) => {
-        modelsRef.current = list;
+        models.current = list;
         if (current) setContextWindow(list.find((m) => m.id === model)?.contextLength ?? null);
       })
       .catch(() => current && setContextWindow(null));
@@ -319,12 +319,18 @@ export default function App() {
     invoke<string | null>("get_api_key")
       .then(setApiKey)
       .catch((e) => {
-        setError(String(e));
+        setAppError(String(e));
         setApiKey(null);
       });
     getSetting<string | null>("workspace", null).then(setWorkspace);
     getSetting("model", DEFAULT_MODEL).then(setModel);
-    getSetting<Mode>("mode", "ask").then(changeMode);
+    getSetting<Mode>("mode", "ask").then((m) => {
+      setDefaultMode(m);
+      live.current.defaultMode = m;
+      // a chat you haven't typed in yet starts in your usual mode
+      const first = ctl.store.get(firstChat);
+      if (first && first.messages.length === 0) ctl.setMode(firstChat, m);
+    });
     getSetting("polish", true).then(setPolishOn);
     getSetting<Partial<Limits>>("limits", {}).then((l) => {
       setLimits(resolveLimits(l));
@@ -332,6 +338,7 @@ export default function App() {
     });
     getSetting("redact", true).then(setRedactOn);
     getSetting("gitBranchPerChat", false).then(setBranchPerChat);
+    getSetting("notifyOn", false).then(setNotifyOn);
     getSetting("activityOpen", false).then(setActivityOpen);
     getSetting("activityWidth", 420).then((w) => setActivityWidth(Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, w))));
   }, []);
@@ -360,9 +367,32 @@ export default function App() {
     return () => window.removeEventListener("beforeunload", flush);
   }, []);
 
+  // Closing the window with agents still working asks first.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    try {
+      void getCurrentWindow()
+        .onCloseRequested(async (event) => {
+          const n = ctl.runningIds().length;
+          if (n === 0) return;
+          const ok = await confirm(
+            `${n === 1 ? "A chat is" : `${n} chats are`} still working. If you quit now, ${n === 1 ? "it" : "they"} will stop where ${n === 1 ? "it is" : "they are"}. You can pick ${n === 1 ? "it" : "them"} up again with Continue.`,
+            { title: "Quit billybot?", kind: "warning", okLabel: "Quit", cancelLabel: "Keep working" },
+          );
+          if (!ok) event.preventDefault();
+          else ctl.stopAll();
+        })
+        .then((u) => (unlisten = u))
+        .catch(() => {});
+    } catch {
+      // not running inside the app (a browser tab, for instance)
+    }
+    return () => unlisten?.();
+  }, []);
+
   // Load this workspace's chats.
   useEffect(() => {
-    if (workspace) listChats(workspace).then(setChats);
+    if (workspace) void listChats(workspace).then(setChats);
   }, [workspace]);
 
   // Hold Command + Option together anywhere in the window to dictate; let go of either to stop.
@@ -386,11 +416,11 @@ export default function App() {
     };
   });
 
-  function changeMode(m: Mode, byUser = false) {
-    modeRef.current = m;
-    setMode(m);
+  /** This chat's mode, and the mode new chats start in. */
+  function changeMode(m: Mode) {
+    ctl.setMode(chatId, m, true);
+    setDefaultMode(m);
     setSetting("mode", m);
-    if (byUser) emitEvent({ category: "chat", summary: `Mode changed to ${MODES.find((x) => x.id === m)?.label ?? m}` }, chatIdRef.current);
   }
 
   async function saveKey() {
@@ -398,9 +428,9 @@ export default function App() {
       await invoke("set_api_key", { key: keyInput });
       setApiKey(keyInput.trim());
       setKeyInput("");
-      setError("");
+      setAppError("");
     } catch (e) {
-      setError(String(e));
+      setAppError(String(e));
     }
   }
 
@@ -409,162 +439,62 @@ export default function App() {
     if (typeof picked !== "string") return;
     try {
       const ws = await invoke<string>("check_workspace", { path: picked });
+      if (ctl.anyRunning()) {
+        const n = ctl.runningIds().length;
+        const ok = await confirm(`${n === 1 ? "A chat is" : `${n} chats are`} working in this workspace. Switching stops ${n === 1 ? "it" : "them"}.`, {
+          title: "Switch workspace?", kind: "warning", okLabel: "Stop and switch", cancelLabel: "Stay",
+        });
+        if (!ok) return;
+      }
+      ctl.reset();
+      setChats([]);
+      setGitInfo({});
       setWorkspace(ws);
+      live.current.workspace = ws;
       setSetting("workspace", ws);
-      setError("");
-      newChat();
+      setAppError("");
+      showChat(ctl.create().id);
     } catch (e) {
-      setError(String(e));
+      setAppError(String(e));
     }
   }
 
-  function setUsageBoth(u: ChatUsage) {
-    usageRef.current = u;
-    setUsage(u);
-  }
+  // ---------- Switching between chats ----------
 
-  function updateQueue(change: (q: Queued[]) => Queued[]) {
-    queueRef.current = change(queueRef.current);
-    setQueue(queueRef.current);
-  }
-
-  /** Adds an event to the log for `forChat`: shown if that chat is on screen, and saved to the audit log. */
-  function emitEvent(draft: ActivityDraft, forChat: string) {
-    const event = makeEvent(draft, forChat);
-    if (forChat === chatIdRef.current) {
-      eventsRef.current = upsertEvent(eventsRef.current, event);
-      setEvents(eventsRef.current);
-    }
-    if (!event.pending) {
-      // Save the merged row (a finished event keeps the id and start time of the running one it replaced).
-      const merged = event.ref ? eventsRef.current.find((e) => e.ref === event.ref && e.chatId === forChat) : undefined;
-      saveActivity(merged ?? event);
-    }
-  }
-
-  /** Switches the log to another chat and loads that chat's saved events. */
-  function switchLog(id: string, load: boolean) {
-    chatIdRef.current = id;
-    eventsRef.current = [];
-    setEvents([]);
-    warnedRef.current = { context: new Set(), budget: false };
-    if (!load) return;
-    loadChatActivity(id).then((saved) => {
-      if (chatIdRef.current !== id) return; // you moved on while it loaded
-      eventsRef.current = mergeEvents(saved, eventsRef.current);
-      setEvents(eventsRef.current);
-    });
+  function showChat(id: string) {
+    setChatId(id);
+    ctl.activate(id);
+    setEditing(null);
   }
 
   function newChat() {
-    const id = newId();
-    setChatId(id);
-    switchLog(id, false);
-    setChatMeta({});
-    setStopped(false);
-    setClosedMidRun(false);
-    setMessages([]);
-    setProjects([]);
-    setSubagents({});
-    setUsageBoth(emptyUsage());
-    setLastUsage(null);
-    setEditing(null);
-    setRuns([]);
-    setChanged({});
-    updateQueue(() => []);
-    setError("");
-  }
-
-  function setRuns(runs: CheckpointRun[]) {
-    checkpointRunsRef.current = runs;
-    setCheckpointRuns(runs);
-  }
-
-  /** Looks at each open project's git state for the badges in the header. */
-  async function refreshGit(names = projects.map((p) => p.name)) {
-    if (!workspace) return;
-    const entries = await Promise.all(
-      names.map(async (name) => [name, await gitStatus(workspace, name).catch(() => undefined)] as const),
-    );
-    setGitInfo((old) => {
-      const next = { ...old };
-      for (const [name, info] of entries) {
-        if (info) next[name] = info;
-        else delete next[name];
-      }
-      return next;
-    });
-  }
-
-  /** Before the agent's first change to a project in this chat, put the chat on its own branch (if that's switched on). */
-  async function prepareBranch(project: string, forChat: string, title: string) {
-    if (!branchPerChat || !workspace) return;
-    const key = `${forChat}:${project}`;
-    if (branchedRef.current.has(key)) return;
-    branchedRef.current.add(key);
-    const info = await gitStatus(workspace, project);
-    if (!isShowable(info) || info.blocked || isChatBranch(info.branch)) return;
-    const name = branchName(title, forChat);
-    try {
-      await gitCreateBranch(workspace, project, name);
-      emitEvent({ category: "chat", summary: `Put ${project} on a new branch, ${name}, before the first change` }, forChat);
-      setNotice(`${project} is now on the branch ${name}.`);
-      void refreshGit([project]);
-    } catch (e) {
-      emitEvent({ category: "chat", level: "warn", summary: `Didn't make a branch for ${project}: ${String(e)}` }, forChat);
-      setNotice(`Didn't make a branch for ${project}: ${String(e)}`);
-    }
-  }
-
-  /** Asks Rust how many files each turn changed, and forgets runs that changed none. */
-  async function refreshChanged(forChat: string, runs: CheckpointRun[]) {
-    try {
-      const status = await checkpointStatus(forChat, runs);
-      if (chatIdRef.current !== forChat) return;
-      setChanged(changedByTurn(runs, status));
-      const live = runs.filter((r) => (status.find((s) => s.runId === r.run)?.files ?? 0) > 0);
-      if (live.length !== runs.length && checkpointRunsRef.current === runs) setRuns(live);
-    } catch {
-      // no undo information available: the buttons just don't show
-    }
-  }
-
-  /** Puts a chat on screen. */
-  function showChat(c: Conversation) {
-    // A chat cut off by closing the app can have tool calls with no results, which the API refuses.
-    const fixed = repairMessages(c.messages);
-    const subs = repairSubagents(c.subagents);
-    setChatId(c.id);
-    switchLog(c.id, true);
-    setChatMeta({ title: c.title, titleEdited: c.titleEdited, pinned: c.pinned, budgetExtra: c.budgetExtra, forkedFrom: c.forkedFrom });
-    setStopped(c.stopped === true);
-    setClosedMidRun(fixed.repaired || subs.repaired);
-    setMessages(fixed.messages);
-    setProjects(c.projects);
-    setSubagents(subs.subagents);
-    setUsageBoth(c.usage ?? emptyUsage());
-    setLastUsage(null);
-    setEditing(null);
-    setRuns(c.checkpoints ?? []);
-    setChanged({});
-    void refreshChanged(c.id, c.checkpoints ?? []);
-    updateQueue(() => []);
-    setError("");
+    // an empty chat is already a new chat
+    if (messages.length === 0 && !s.draft && !busy) return;
+    showChat(ctl.create().id);
   }
 
   async function openChat(id: string) {
     if (!workspace) return;
+    if (ctl.store.has(id)) {
+      showChat(id); // a chat that is working shows what it is doing right now
+      return;
+    }
     const c = await loadChat(workspace, id);
     if (!c) {
-      setError("That chat couldn't be opened. It may have been deleted or damaged.");
+      ctl.setError(chatId, "That chat couldn't be opened. It may have been deleted or damaged.");
       setChats(await listChats(workspace));
       return;
     }
-    showChat(c);
+    ctl.ensure(c);
+    showChat(id);
   }
 
   async function removeChat(id: string) {
     if (!workspace) return;
+    if (!ctl.remove(id)) {
+      ctl.setNotice(chatId, "That chat is working. Stop it before deleting it.");
+      return;
+    }
     await deleteConversation(workspace, id);
     invoke("checkpoint_delete_chat", { chatId: id }).catch(() => {});
     setChats(await listChats(workspace));
@@ -573,200 +503,92 @@ export default function App() {
 
   async function renameChat(id: string, title: string) {
     if (!workspace) return;
-    await updateChatMeta(workspace, id, { title });
-    if (id === chatId) setChatMeta((m) => ({ ...m, title: title.trim(), titleEdited: true }));
+    if (ctl.store.has(id)) ctl.updateMeta(id, { title });
+    else await updateChatMeta(workspace, id, { title });
     setChats(await listChats(workspace));
   }
 
   async function pinChat(id: string, pinned: boolean) {
     if (!workspace) return;
-    await updateChatMeta(workspace, id, { pinned });
-    if (id === chatId) setChatMeta((m) => ({ ...m, pinned }));
+    if (ctl.store.has(id)) ctl.updateMeta(id, { pinned });
+    else await updateChatMeta(workspace, id, { pinned });
     setChats(await listChats(workspace));
   }
 
   // You can close a project or flip it between read-only and writable yourself.
   function toggleWritable(name: string) {
-    setProjects((ps) => ps.map((p) => (p.name === name ? { ...p, writable: !p.writable } : p)));
+    ctl.setProjects(chatId, (ps) => ps.map((p) => (p.name === name ? { ...p, writable: !p.writable } : p)));
   }
   function closeProject(name: string) {
-    setProjects((ps) => ps.filter((p) => p.name !== name));
+    ctl.setProjects(chatId, (ps) => ps.filter((p) => p.name !== name));
   }
 
-  // Agents call this and wait until you click a button on the approval card.
-  function ask(req: ApprovalRequest) {
-    return new Promise<Approval>((resolve) => setApprovals((q) => [...q, { req, resolve }]));
-  }
+  // ---------- Working in the chat on screen ----------
 
   function answer(a: Approval) {
-    approvals[0]?.resolve(a);
-    setApprovals((q) => q.slice(1));
+    ctl.answer(chatId, a);
   }
 
   async function stop() {
-    abortRef.current?.abort();
-    invoke("cancel_commands").catch(() => {}); // kills any command that is running right now
-    approvals.forEach((p) => p.resolve("deny")); // unblocks anything waiting on you
-    setApprovals([]);
+    ctl.stop(chatId);
     // Queued messages were meant for a run that is over. Ask before throwing away more than one.
-    const waiting = queueRef.current.length;
+    const waiting = ctl.store.get(chatId)?.queue.length ?? 0;
     if (waiting === 0) return;
     const clear =
       waiting === 1 ||
       (await confirm(`Also discard the ${waiting} messages waiting in the queue?`, { title: "Stop", okLabel: "Discard", cancelLabel: "Keep them" }));
-    if (clear) updateQueue(() => []);
-    else updateQueue((q) => q.map((x) => ({ ...x, steering: false })));
+    if (clear) ctl.clearQueue(chatId);
+    else ctl.keepQueue(chatId);
   }
 
-  /** Sends what you typed, or lines it up behind the run in progress. */
+  function stopAll() {
+    ctl.stopAll();
+  }
+
   function send() {
-    const text = input.trim();
-    if (!text) return;
-    setInput("");
-    if (busy) {
-      updateQueue((q) => [...q, { id: newId(), text }]);
-      return;
-    }
-    run([...messages, { role: "user", content: text }]);
+    ctl.send(chatId, s.draft);
   }
 
-  /** A queued message: join the run at its next step if one is going, otherwise send it now. */
-  function sendQueued(id: string) {
-    const item = queueRef.current.find((q) => q.id === id);
-    if (!item) return;
-    if (busy) {
-      updateQueue((q) => q.map((x) => (x.id === id ? { ...x, steering: true } : x)));
-      return;
-    }
-    updateQueue((q) => q.filter((x) => x.id !== id));
-    run([...messages, { role: "user", content: item.text }]);
-  }
-
-  /** Takes a queued message back into the box to change it. */
   function editQueued(id: string) {
-    const item = queueRef.current.find((q) => q.id === id);
-    if (!item || item.steering) return;
-    updateQueue((q) => q.filter((x) => x.id !== id));
-    setInput(item.text);
-  }
-
-  // When a run finishes normally, the next queued message goes out by itself.
-  useEffect(() => {
-    if (busy || approvals.length > 0 || queue.length === 0) return;
-    if (state !== "done" && state !== "limit") return;
-    const [next] = queue;
-    updateQueue((q) => q.slice(1));
-    run([...messages, { role: "user", content: next.text }]);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [busy, queue, state]);
-
-  /** Picks up where a stopped, cut-off or step-limited run left off. */
-  function continueRun() {
-    if (busy) return;
-    const last = messages[messages.length - 1];
-    // If the last thing is your own message, it never got an answer: ask again rather than add another.
-    run(last?.role === "user" ? messages : [...messages, { role: "user", content: "Continue." }]);
-  }
-
-  /** The agent proposed a plan in Plan mode; you're happy with it. Edits can go through now, commands still ask. */
-  function approvePlan() {
-    if (busy) return;
-    changeMode("acceptEdits", true);
-    run([...messages, { role: "user", content: "The plan is approved. Go ahead and carry it out." }]);
-  }
-
-  /** Raises this chat's budget and carries on. */
-  function addBudgetAndContinue() {
-    if (busy) return;
-    const meta = { ...chatMeta, budgetExtra: (chatMeta.budgetExtra ?? 0) + budgetStep(cap) };
-    run([...messages, { role: "user", content: "Continue." }], { meta });
-  }
-
-  /** From the cost chip: allow this chat to spend more. */
-  async function addBudget(dollars: number) {
-    if (!workspace) return;
-    const budgetExtra = (chatMeta.budgetExtra ?? 0) + dollars;
-    setChatMeta((m) => ({ ...m, budgetExtra }));
-    if (messages.length > 0) await updateChatMeta(workspace, chatId, { budgetExtra }).catch(() => {});
+    const text = ctl.takeQueued(chatId, id);
+    if (text !== null) ctl.setDraft(chatId, text);
   }
 
   /** Shows what undoing a turn's file changes would do, and waits for you to confirm. */
   async function startRevert(turn: number) {
     if (busy) return;
-    const runIds = runsFrom(checkpointRunsRef.current, turn, true);
+    const runIds = runsFrom(s.runs, turn, true);
     try {
-      setRevertPlan({ runIds, summary: describePlan(await previewRevert(chatIdRef.current, runIds)) });
+      setRevertPlan({ runIds, summary: describePlan(await previewRevert(chatId, runIds)) });
     } catch (e) {
-      setError(`Undo: ${e instanceof Error ? e.message : String(e)}`);
+      ctl.setError(chatId, `Undo: ${e instanceof Error ? e.message : String(e)}`);
     }
-  }
-
-  /** Reverts runs and reports what happened. Files you changed since are left alone unless `force`. */
-  async function undoRuns(runIds: string[], force: boolean) {
-    const forChat = chatIdRef.current;
-    try {
-      const result = await revertRuns(forChat, runIds, force);
-      const text = summarizeRevert(result);
-      setNotice(text);
-      emitEvent({ category: "chat", level: result.skipped.length ? "warn" : "info", summary: text }, forChat);
-    } catch (e) {
-      setError(`Undo: ${e instanceof Error ? e.message : String(e)}`);
-    }
-    await refreshChanged(forChat, checkpointRunsRef.current);
-    void refreshGit();
   }
 
   async function confirmRevert(force: boolean) {
     const plan = revertPlan;
     setRevertPlan(null);
-    if (plan) await undoRuns(plan.runIds, force);
+    if (plan) await ctl.undoRuns(chatId, plan.runIds, force);
   }
 
   /** Throws away the last reply and asks again. */
-  async function regenerate() {
+  function regenerate() {
     if (busy) return;
     const at = messages.map((m) => m.role).lastIndexOf("user");
     if (at === -1) return;
     // If the reply changed files or ran commands, say so first (and offer to undo the files).
     if (actedIn(messages.slice(at + 1))) setRegenChoice(at);
-    else regenerateFrom(at, false);
+    else void ctl.regenerate(chatId, false);
   }
 
-  async function regenerateFrom(at: number, undo: boolean) {
+  function regenerateConfirmed(undo: boolean) {
     setRegenChoice(null);
-    if (undo) await undoRuns(runsFrom(checkpointRunsRef.current, at), false);
-    const kept = messages.slice(0, at + 1);
-    run(kept, { subagents: subagentsFor(kept) });
-  }
-
-  /** The subagent runs that belong to these messages. */
-  function subagentsFor(kept: ChatCompletionMessageParam[]) {
-    const ids = new Set(kept.flatMap((m) => (m.role === "assistant" ? (m.tool_calls ?? []).map((c) => c.id) : [])));
-    return Object.fromEntries(Object.entries(subagents).filter(([id]) => ids.has(id)));
-  }
-
-  /** A new chat made from these messages of the open one. It starts with no cost; that stays with the original. */
-  function makeFork(kept: ChatCompletionMessageParam[], messageIndex: number): Conversation {
-    const base = chatMeta.titleEdited && chatMeta.title ? chatMeta.title : autoTitle(messages);
-    return {
-      id: newId(),
-      title: `${base} (fork)`.slice(0, 100),
-      titleEdited: true,
-      updatedAt: Date.now(),
-      messages: kept,
-      projects: projects.map((p) => ({ ...p })),
-      subagents: subagentsFor(kept),
-      usage: emptyUsage(),
-      forkedFrom: { chatId, messageIndex },
-    };
+    void ctl.regenerate(chatId, undo);
   }
 
   async function forkChat(index: number) {
-    if (!workspace || busy) return;
-    const fork = makeFork(forkMessages(messages, index), index);
-    await saveConversation(workspace, fork);
-    setChats(await listChats(workspace));
-    showChat(fork);
+    const id = await ctl.fork(chatId, index);
+    if (id) showChat(id);
   }
 
   // Editing one of your messages: you choose whether to branch off or replace what came after.
@@ -783,31 +605,22 @@ export default function App() {
   async function editInFork() {
     const choice = editChoice;
     setEditChoice(null);
-    if (!choice || !workspace || busy) return;
-    const kept = forkMessages(messages, choice.index - 1);
-    const fork = makeFork(kept, choice.index);
-    await saveConversation(workspace, fork);
-    showChat(fork);
-    run([...kept, { role: "user", content: choice.text }], {
-      id: fork.id,
-      meta: { title: fork.title, titleEdited: true, forkedFrom: fork.forkedFrom },
-      subagents: fork.subagents,
-      usage: emptyUsage(),
-    });
+    if (!choice) return;
+    const id = await ctl.editInFork(chatId, choice.index, choice.text);
+    if (id) showChat(id);
   }
 
-  async function editInPlace() {
+  function editInPlace() {
     const choice = editChoice;
     setEditChoice(null);
-    if (!choice || busy) return;
-    if (undoDiscarded && filesFrom(changed, choice.index) > 0) await undoRuns(runsFrom(checkpointRunsRef.current, choice.index), false);
-    const kept = messages.slice(0, choice.index);
-    run([...kept, { role: "user", content: choice.text }], { subagents: subagentsFor(kept) });
+    if (!choice) return;
+    setEditing(null);
+    void ctl.editInPlace(chatId, choice.index, choice.text, undoDiscarded && filesFrom(changed, choice.index) > 0);
   }
 
   async function exportChat(format: "md" | "json") {
-    if (messages.length === 0) return;
-    const convo = buildConversation({ id: chatId, meta: chatMeta, messages, projects, subagents, usage, stopped, checkpoints: checkpointRuns });
+    const convo = ctl.snapshot(chatId, false);
+    if (!convo || convo.messages.length === 0) return;
     const options = { fullToolOutput: fullOutput };
     const text = format === "md" ? chatToMarkdown(convo, options) : chatToJson(convo, options);
     try {
@@ -817,203 +630,52 @@ export default function App() {
       });
       if (!path) return;
       await invoke("write_export", { path, contents: text });
-      setNotice(`Saved ${baseName(path)}. Secrets were redacted.`);
+      ctl.setNotice(chatId, `Saved ${baseName(path)}. Secrets were redacted.`);
     } catch (e) {
-      setError(`Export: ${e instanceof Error ? e.message : String(e)}`);
-    }
-  }
-
-  /** Runs the agent on `history` and saves the chat as it goes, so closing the app mid-run loses little. */
-  async function run(history: ChatCompletionMessageParam[], opts: RunOptions = {}) {
-    if (!workspace || !apiKey || busy) return;
-    setError("");
-    setNotice("");
-    setBusy(true);
-    setStopped(false);
-    setClosedMidRun(false);
-    setEditing(null);
-    setMessages(history);
-    if (opts.meta) setChatMeta(opts.meta);
-    if (opts.usage) setUsageBoth(opts.usage);
-    const controller = new AbortController();
-    abortRef.current = controller;
-    let latest = history;
-    let latestProjects = projects.map((p) => ({ ...p })); // the loop changes this copy
-    let subs = { ...(opts.subagents ?? subagents) };
-    const id = opts.id ?? chatId;
-    const meta = opts.meta ?? chatMeta;
-    const turn = history.map((m) => m.role).lastIndexOf("user"); // costs and undo are kept per turn
-    const runId = newId();
-    setRuns([...checkpointRunsRef.current, { run: runId, turn }]);
-    const chatCap = effectiveCap(limits.budgetUsd, meta.budgetExtra);
-    const emit = (draft: ActivityDraft) => emitEvent(draft, id);
-    const runRef = `run-${id}-${Date.now()}`;
-    let failure: string | undefined;
-    emit({
-      category: "run", ref: runRef, pending: true, summary: `Run started with ${model}`,
-      detail: {
-        mode: modeRef.current, messages: history.length, projects: projects.map((p) => `${p.name}${p.writable ? "" : " (read-only)"}`),
-        ...(chatCap > 0 ? { budget: chatCap } : {}),
-      },
-    });
-
-    const snapshot = (wasStopped = false) =>
-      buildConversation({ id, meta, messages: latest, projects: latestProjects, subagents: subs, usage: usageRef.current, stopped: wasStopped, checkpoints: checkpointRunsRef.current });
-    // Save at most every couple of seconds while the agent works (not on every streamed word).
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const saveSoon = () => {
-      if (timer) return;
-      timer = setTimeout(() => {
-        timer = undefined;
-        saveConversation(workspace, snapshot()).catch(() => {});
-      }, 2000);
-    };
-
-    // Your message is saved before the agent starts, so it survives a crash.
-    try {
-      await saveConversation(workspace, snapshot());
-      setChats(await listChats(workspace));
-    } catch (e) {
-      setError(`Couldn't save this chat: ${e instanceof Error ? e.message : String(e)}`);
-      emit({ category: "error", level: "error", summary: `Couldn't save this chat: ${e instanceof Error ? e.message : String(e)}` });
-    }
-
-    try {
-      latest = await runAgent({
-        apiKey,
-        model,
-        workspace,
-        projects: latestProjects,
-        onProjectsChange: (p) => {
-          latestProjects = p;
-          setProjects(p);
-        },
-        getMode: () => modeRef.current,
-        limits,
-        redact: redactOn,
-        checkpoint: { chatId: id, runId },
-        beforeWrite: (project) => prepareBranch(project, id, meta.titleEdited && meta.title ? meta.title : autoTitle(latest)),
-        messages: history,
-        ask,
-        signal: controller.signal,
-        onUpdate: (msgs, partial) => {
-          latest = msgs;
-          setMessages([...msgs]);
-          setStreaming(partial);
-          if (!partial) saveSoon();
-        },
-        onSubagent: (callId, sub) => {
-          subs = { ...subs, [callId]: sub };
-          setSubagents(subs);
-          saveSoon();
-        },
-        onUsage: (u) => {
-          if (u.role === "main") setLastUsage({ promptTokens: u.promptTokens, completionTokens: u.completionTokens });
-          const price = modelsRef.current.find((m) => m.id === u.model);
-          const total = addUsage(usageRef.current, u, price, turn);
-          setUsageBoth(total);
-          // Say once when the conversation or the budget is getting full.
-          const warned = warnedRef.current;
-          if (u.role === "main" && contextWindow) {
-            for (const tier of [0.9, 0.7]) {
-              if (u.promptTokens / contextWindow >= tier && !warned.context.has(tier)) {
-                warned.context.add(tier);
-                if (tier === 0.9) warned.context.add(0.7);
-                emit({ category: "chat", level: "warn", summary: `The conversation fills ${Math.round((u.promptTokens / contextWindow) * 100)}% of the model's context` });
-                break;
-              }
-            }
-          }
-          if (!warned.budget && budgetState(total.cost, chatCap) === "warn") {
-            warned.budget = true;
-            emit({ category: "chat", level: "warn", summary: `This chat has used 80% of its ${formatCost(chatCap)} budget` });
-          }
-        },
-        onEvent: emit,
-        overBudget: () => (chatCap > 0 && usageRef.current.cost >= chatCap ? chatCap : null),
-        takeSteering: () => {
-          const mine = queueRef.current.filter((q) => q.steering);
-          if (mine.length === 0) return [];
-          updateQueue((q) => q.filter((x) => !x.steering));
-          return mine.map((q) => q.text);
-        },
-      });
-    } catch (e) {
-      if (!controller.signal.aborted) {
-        failure = e instanceof Error ? e.message : String(e);
-        setError(failure);
-      }
-    } finally {
-      if (timer) clearTimeout(timer);
-      // A message sent "now" that the run finished before reading goes back to waiting its turn.
-      updateQueue((q) => q.map((x) => (x.steering ? { ...x, steering: false } : x)));
-      setStreaming("");
-      setBusy(false);
-      setApprovals([]);
-      setMessages(latest);
-      const wasStopped = controller.signal.aborted;
-      setStopped(wasStopped);
-      const ending = runState(latest);
-      emit({
-        category: "run", ref: runRef,
-        level: failure ? "error" : wasStopped || ending !== "done" ? "warn" : "info",
-        summary: failure ? `Run failed: ${failure}`
-          : wasStopped ? "Run stopped by you"
-          : ending === "limit" ? "Run stopped at the step limit"
-          : ending === "budget" ? "Run stopped at the budget"
-          : ending === "done" ? "Run finished" : "Run ended without an answer",
-        detail: { messages: latest.length },
-      });
-      try {
-        await saveConversation(workspace, snapshot(wasStopped));
-        setChats(await listChats(workspace));
-        await refreshChanged(id, checkpointRunsRef.current);
-        void refreshGit(latestProjects.map((p) => p.name));
-      } catch (e) {
-        setError(`Couldn't save this chat: ${e instanceof Error ? e.message : String(e)}`);
-        emit({ category: "error", level: "error", summary: `Couldn't save this chat: ${e instanceof Error ? e.message : String(e)}` });
-      }
+      ctl.setError(chatId, `Export: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
   async function exportActivity(visible: ActivityEvent[]) {
     try {
-      const path = await save({ defaultPath: exportFileName(`${chatMeta.title ?? autoTitle(messages)} activity`, "json"), filters: [{ name: "JSON", extensions: ["json"] }] });
+      const path = await save({ defaultPath: exportFileName(`${titleOf(s)} activity`, "json"), filters: [{ name: "JSON", extensions: ["json"] }] });
       if (!path) return;
       await invoke("write_export", { path, contents: JSON.stringify(visible, null, 2) });
-      setNotice(`Saved ${baseName(path)}.`);
+      ctl.setNotice(chatId, `Saved ${baseName(path)}.`);
     } catch (e) {
-      setError(`Export: ${e instanceof Error ? e.message : String(e)}`);
+      ctl.setError(chatId, `Export: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
   function startDictation() {
     if (!apiKey || !workspace || recordingRef.current) return;
-    setError("");
-    const pending = startRecording();
-    recordingRef.current = pending;
+    ctl.setError(chatId, "");
+    dictationChat.current = chatId;
+    const pendingRecording = startRecording();
+    recordingRef.current = pendingRecording;
     setDictation("recording");
-    pending.catch((e) => {
+    pendingRecording.catch((e) => {
       recordingRef.current = null;
       setDictation("idle");
-      setError(`Microphone: ${e instanceof Error ? e.message : String(e)}`);
+      ctl.setError(dictationChat.current, `Microphone: ${e instanceof Error ? e.message : String(e)}`);
     });
   }
 
   async function stopDictation() {
-    const pending = recordingRef.current;
-    if (!pending || !apiKey) return;
+    const pendingRecording = recordingRef.current;
+    if (!pendingRecording || !apiKey) return;
     recordingRef.current = null;
     setDictation("working");
+    const target = dictationChat.current;
     try {
-      const recording = await pending;
+      const recording = await pendingRecording;
       const audio = await recording.stop();
       if (Date.now() - recording.startedAt < 400) return; // a quick tap, not speech
       let text = await transcribe(audio);
       if (text && polishOn) text = await polish(apiKey, text).catch(() => text);
-      if (text) setInput((prev) => (prev.trim() ? prev.trimEnd() + " " : "") + text);
+      if (text && ctl.store.has(target)) ctl.appendDraft(target, text);
     } catch (e) {
-      setError(`Dictation: ${e instanceof Error ? e.message : String(e)}`);
+      ctl.setError(target, `Dictation: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setDictation("idle");
     }
@@ -1034,7 +696,7 @@ export default function App() {
       <Setup
         title="Add your OpenRouter key"
         description={`It's saved in ${keyStoreName}, never in a file.`}
-        error={error}
+        error={appError}
         action={
           <Button className="w-full" onClick={saveKey} disabled={!keyInput.trim()}>
             Save key
@@ -1051,7 +713,7 @@ export default function App() {
       <Setup
         title="Choose your workspace"
         description="Pick the folder that holds your projects, such as ~/Projects. The agent can work in any folder inside it, and nothing outside it."
-        error={error}
+        error={appError}
         action={
           <Button className="w-full" onClick={pickWorkspace}>
             <FolderIcon />
@@ -1064,8 +726,6 @@ export default function App() {
     );
   }
 
-  const pending = approvals[0];
-
   return (
     <TooltipProvider>
       <SidebarProvider>
@@ -1073,24 +733,45 @@ export default function App() {
           <SidebarHeader>
             <SidebarMenu>
               <SidebarMenuItem>
-                <SidebarMenuButton onClick={pickWorkspace} disabled={busy} tooltip={workspace}>
+                <SidebarMenuButton onClick={pickWorkspace} tooltip={workspace}>
                   <FolderIcon />
                   <span>{baseName(workspace)}</span>
                 </SidebarMenuButton>
               </SidebarMenuItem>
               <SidebarMenuItem>
-                <SidebarMenuButton onClick={newChat} disabled={busy}>
+                <SidebarMenuButton onClick={newChat}>
                   <PlusIcon />
                   <span>New chat</span>
                 </SidebarMenuButton>
               </SidebarMenuItem>
+              {waitingOnYou.length > 0 && (
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    onClick={() => void openChat(waitingOnYou.find((id) => id !== chatId) ?? waitingOnYou[0])}
+                    className="text-amber-700 dark:text-amber-400"
+                  >
+                    <ShieldCheckIcon />
+                    <span>
+                      {waitingOnYou.length === 1 ? "1 chat needs you" : `${waitingOnYou.length} chats need you`}
+                    </span>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              )}
+              {workingCount > 1 && (
+                <SidebarMenuItem>
+                  <SidebarMenuButton onClick={stopAll}>
+                    <SquareIcon />
+                    <span>Stop all ({workingCount} working)</span>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              )}
             </SidebarMenu>
           </SidebarHeader>
           <SidebarContent>
             <ChatList
               chats={chats}
               activeId={chatId}
-              busy={busy}
+              status={summaries}
               onOpen={openChat}
               onDelete={removeChat}
               onRename={renameChat}
@@ -1186,7 +867,7 @@ export default function App() {
               >
                 <ActivityIcon />
               </Button>
-              <CostChip usage={usage} cap={cap} onAddBudget={addBudget} disabled={busy} />
+              <CostChip usage={usage} cap={cap} onAddBudget={(dollars) => ctl.addBudget(chatId, dollars)} disabled={busy} />
               <ExportMenu
                 disabled={messages.length === 0}
                 fullOutput={fullOutput}
@@ -1194,6 +875,11 @@ export default function App() {
                 onExport={exportChat}
               />
               <LimitsPopover
+                notifyOn={notifyOn}
+                onNotifyChange={(on) => {
+                  setNotifyOn(on);
+                  setSetting("notifyOn", on);
+                }}
                 branchPerChat={branchPerChat}
                 onBranchPerChatChange={(on) => {
                   setBranchPerChat(on);
@@ -1244,6 +930,11 @@ export default function App() {
           </div>
 
           <div className="mx-auto flex w-full max-w-3xl flex-col gap-3 p-4">
+            {s.phase === "waiting" && (
+              <p className="text-sm text-muted-foreground">
+                Waiting for a free slot: {workingCount - 1} other {workingCount - 1 === 1 ? "chat is" : "chats are"} working, and the limit is {limits.maxConcurrentRuns}. Change it in Limits.
+              </p>
+            )}
             {!busy && state !== "none" && (
               <div className="flex items-center gap-2 text-sm text-muted-foreground">
                 <span className="flex-1">
@@ -1256,20 +947,20 @@ export default function App() {
                         : STATE_NOTE[state]}
                 </span>
                 {state === "budget" && cap > 0 ? (
-                  <Button size="sm" variant="outline" onClick={addBudgetAndContinue}>
+                  <Button size="sm" variant="outline" onClick={() => ctl.addBudgetAndContinue(chatId, budgetStep(cap))}>
                     <PlayIcon />
                     Add {formatCost(budgetStep(cap))} and continue
                   </Button>
                 ) : (
                   state !== "done" && (
-                    <Button size="sm" variant="outline" onClick={continueRun}>
+                    <Button size="sm" variant="outline" onClick={() => ctl.continueRun(chatId)}>
                       <PlayIcon />
                       {messages[messages.length - 1]?.role === "user" ? "Retry" : "Continue"}
                     </Button>
                   )
                 )}
-                {mode === "plan" && state === "done" && (
-                  <Button size="sm" onClick={approvePlan} title="Switch to Auto-accept edits and tell the agent to go ahead">
+                {s.mode === "plan" && state === "done" && (
+                  <Button size="sm" onClick={() => ctl.approvePlan(chatId)} title="Switch to Auto-accept edits and tell the agent to go ahead">
                     <PlayIcon />
                     Approve plan
                   </Button>
@@ -1307,7 +998,7 @@ export default function App() {
                         <Button
                           size="xs"
                           variant="ghost"
-                          onClick={() => sendQueued(q.id)}
+                          onClick={() => ctl.sendQueued(chatId, q.id)}
                           title={busy ? "Add this to the run at its next step" : "Send this now"}
                         >
                           {busy ? "Send now" : "Send"}
@@ -1318,7 +1009,7 @@ export default function App() {
                         <Button
                           size="icon-xs"
                           variant="ghost"
-                          onClick={() => updateQueue((list) => list.filter((x) => x.id !== q.id))}
+                          onClick={() => ctl.removeQueued(chatId, q.id)}
                           aria-label="Remove queued message"
                         >
                           <XIcon />
@@ -1432,16 +1123,16 @@ export default function App() {
             >
               <InputGroup>
                 <InputGroupTextarea
-                  value={input}
+                  value={s.draft}
                   placeholder={
                     busy ? "Type to queue a message… (Enter to queue)" : "Ask something… (Enter to send, hold ⌘ ⌥ to dictate)"
                   }
                   className="p-3"
-                  onChange={(e) => setInput(e.target.value)}
+                  onChange={(e) => ctl.setDraft(chatId, e.target.value)}
                   onKeyDown={(e) => {
                     if (e.key === "Tab" && e.shiftKey) {
                       e.preventDefault();
-                      changeMode(nextMode(mode), true);
+                      changeMode(nextMode(s.mode));
                     } else if (e.key === "Enter" && !e.shiftKey) {
                       e.preventDefault();
                       send();
@@ -1451,13 +1142,13 @@ export default function App() {
                 <InputGroupAddon align="block-end">
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
-                      <InputGroupButton size="sm" className={MODES.find((m) => m.id === mode)?.tone} title="Permission mode (Shift+Tab to change)">
-                        {MODES.find((m) => m.id === mode)?.label}
+                      <InputGroupButton size="sm" className={MODES.find((m) => m.id === s.mode)?.tone} title="Permission mode (Shift+Tab to change)">
+                        {MODES.find((m) => m.id === s.mode)?.label}
                         <ChevronDownIcon />
                       </InputGroupButton>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="start" className="w-72">
-                      <DropdownMenuRadioGroup value={mode} onValueChange={(v) => changeMode(v as Mode, true)}>
+                      <DropdownMenuRadioGroup value={s.mode} onValueChange={(v) => changeMode(v as Mode)}>
                         {MODES.map((m) => (
                           <DropdownMenuRadioItem key={m.id} value={m.id} className="items-start">
                             <span className="flex flex-col">
@@ -1505,7 +1196,7 @@ export default function App() {
                       size="icon-sm"
                       variant="default"
                       className="rounded-full"
-                      disabled={!input.trim()}
+                      disabled={!s.draft.trim()}
                       aria-label="Send"
                     >
                       <ArrowUpIcon />
@@ -1529,10 +1220,7 @@ export default function App() {
               setActivityOpen(false);
               setSetting("activityOpen", false);
             }}
-            onClear={() => {
-              eventsRef.current = [];
-              setEvents([]);
-            }}
+            onClear={() => ctl.clearEvents(chatId)}
             onExport={exportActivity}
           />
         )}
@@ -1556,7 +1244,7 @@ export default function App() {
           )}
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <Button onClick={() => regenChoice !== null && regenerateFrom(regenChoice, undoDiscarded && filesFrom(changed, regenChoice) > 0)}>
+            <Button onClick={() => regenChoice !== null && regenerateConfirmed(undoDiscarded && filesFrom(changed, regenChoice) > 0)}>
               Regenerate
             </Button>
           </AlertDialogFooter>
@@ -1612,8 +1300,8 @@ export default function App() {
           model={model}
           busy={busy}
           onCommitted={(summary) => {
-            setNotice(`Committed ${changesFor}: ${summary}`);
-            emitEvent({ category: "chat", summary: `You committed in ${changesFor}: ${summary}` }, chatIdRef.current);
+            ctl.setNotice(chatId, `Committed ${changesFor}: ${summary}`);
+            ctl.emit(chatId, { category: "chat", summary: `You committed in ${changesFor}: ${summary}` });
             void refreshGit([changesFor]);
           }}
         />
