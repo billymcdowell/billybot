@@ -19,6 +19,7 @@ import {
   PlayIcon,
   PlusIcon,
   RefreshCwIcon,
+  SettingsIcon,
   ShieldCheckIcon,
   SquareIcon,
   TerminalIcon,
@@ -64,7 +65,6 @@ import {
   SidebarTrigger,
 } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
-import { Switch } from "@/components/ui/switch";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { DEFAULT_MODEL, loadInstructions, systemPrompt, toolsFor } from "./agent";
 import { textOf } from "./text";
@@ -77,6 +77,7 @@ import { checkpointStatus, describePlan, filesFrom, previewRevert, revertRuns, r
 import CostChip, { budgetStep } from "./CostChip";
 import ContextMeter from "./ContextMeter";
 import { contextBreakdown } from "./context";
+import { view } from "./compaction";
 import { effectiveCap, formatCost } from "./cost";
 import ExportMenu from "./ExportMenu";
 import { chatToJson, chatToMarkdown, exportFileName } from "./exportChat";
@@ -85,11 +86,10 @@ import { runState, type RunState } from "./history";
 import { formatInstructions, type ProjectInstructions } from "./instructions";
 import DiffView from "./DiffView";
 import ModelPicker from "./ModelPicker";
-import LimitsPopover from "./LimitsPopover";
+import SettingsDialog from "./SettingsDialog";
 import { DEFAULT_LIMITS, resolveLimits, type Limits } from "./limits";
 import MultiEditDiff from "./MultiEditDiff";
 import QuestionCard from "./QuestionCard";
-import ThemeToggle from "./ThemeToggle";
 import TodoList from "./TodoList";
 import { fetchToolModels, type ModelInfo } from "./models";
 import MessageList, { type EditingMessage } from "./Messages";
@@ -171,6 +171,7 @@ const live = {
     branchPerChat: false,
     defaultMode: "ask" as Mode,
     notifyOn: false,
+    autoCompact: true,
   },
 };
 const models: { current: ModelInfo[] } = { current: [] };
@@ -198,6 +199,7 @@ const ctl = createController({
   checkpointStatus,
   revertRuns,
   cancelCommands: (runId) => void invoke("cancel_commands", { runId }).catch(() => {}),
+  autoCompact: () => live.current.autoCompact,
   notify: (title, body) => {
     if (live.current.notifyOn && !document.hasFocus()) void sendDesktopNotification(title, body);
   },
@@ -215,10 +217,12 @@ export default function App() {
   const [appError, setAppError] = useState(""); // trouble with the key or workspace, before any chat
   const [chatId, setChatId] = useState(firstChat); // the chat on screen
   const [polishOn, setPolishOn] = useState(true);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [limits, setLimits] = useState<Limits>(DEFAULT_LIMITS);
   const [limitsReady, setLimitsReady] = useState(false);
   const [redactOn, setRedactOn] = useState(true); // hide secrets from the model
   const [branchPerChat, setBranchPerChat] = useState(false); // put each chat's changes on their own git branch
+  const [autoCompactOn, setAutoCompactOn] = useState(true); // summarize old messages when a chat fills the model's window
   const [notifyOn, setNotifyOn] = useState(false); // tell me when a chat finishes or needs me while the app is in the background
   const [contextWindow, setContextWindow] = useState<number | null>(null);
   const [instructions, setInstructions] = useState<ProjectInstructions[]>([]); // CLAUDE.md of the open projects
@@ -266,6 +270,7 @@ export default function App() {
     branchPerChat,
     defaultMode,
     notifyOn,
+    autoCompact: autoCompactOn,
   };
 
   /** Looks at each open project's git state for the badges in the header. */
@@ -323,11 +328,11 @@ export default function App() {
         }),
         toolsText: JSON.stringify(toolsFor("main")),
         instructionsText: formatInstructions(instructions),
-        messages,
+        messages: view(messages, s.compaction), // what the model is actually sent
         streaming,
         window: contextWindow,
       }),
-    [projects, workspace, instructions, messages, streaming, contextWindow],
+    [projects, workspace, instructions, messages, s.compaction, streaming, contextWindow],
   );
 
   // On startup: read the key from the system credential store and restore settings.
@@ -355,6 +360,7 @@ export default function App() {
     getSetting("redact", true).then(setRedactOn);
     getSetting("gitBranchPerChat", false).then(setBranchPerChat);
     getSetting("notifyOn", false).then(setNotifyOn);
+    getSetting("autoCompact", true).then(setAutoCompactOn);
     getSetting("activityOpen", false).then(setActivityOpen);
     getSetting("activityWidth", 420).then((w) => setActivityWidth(Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, w))));
   }, []);
@@ -833,6 +839,12 @@ export default function App() {
                   <span>Always allowed…</span>
                 </SidebarMenuButton>
               </SidebarMenuItem>
+              <SidebarMenuItem>
+                <SidebarMenuButton size="sm" onClick={() => setSettingsOpen(true)}>
+                  <SettingsIcon />
+                  <span>Settings</span>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
             </SidebarMenu>
           </SidebarFooter>
         </Sidebar>
@@ -891,15 +903,6 @@ export default function App() {
               ))}
             </div>
             <div className="flex items-center gap-2">
-              <Switch
-                id="polish"
-                checked={polishOn}
-                onCheckedChange={(on) => {
-                  setPolishOn(on);
-                  setSetting("polish", on);
-                }}
-              />
-              <Label htmlFor="polish">Polish dictation</Label>
               <Button
                 size="icon-xs"
                 variant={activityOpen ? "default" : "outline"}
@@ -920,29 +923,6 @@ export default function App() {
                 onFullOutputChange={setFullOutput}
                 onExport={exportChat}
               />
-              <LimitsPopover
-                notifyOn={notifyOn}
-                onNotifyChange={(on) => {
-                  setNotifyOn(on);
-                  setSetting("notifyOn", on);
-                }}
-                branchPerChat={branchPerChat}
-                onBranchPerChatChange={(on) => {
-                  setBranchPerChat(on);
-                  setSetting("gitBranchPerChat", on);
-                }}
-                redact={redactOn}
-                onRedactChange={(on) => {
-                  setRedactOn(on);
-                  setSetting("redact", on);
-                }}
-                limits={limits}
-                onChange={(l) => {
-                  setLimits(l);
-                  setSetting("limits", l);
-                }}
-              />
-              <ThemeToggle />
             </div>
           </header>
 
@@ -962,6 +942,7 @@ export default function App() {
                 turnCosts={usage.turns}
                 changedTurns={changed}
                 onRevert={startRevert}
+                compaction={s.compaction}
                 onStopSubagent={(callId) => ctl.stopSubagent(chatId, callId)}
                 waitingSubagents={waitingSubagents}
                 busy={busy}
@@ -1252,7 +1233,13 @@ export default function App() {
                       setSetting("model", id);
                     }}
                   />
-                  <ContextMeter breakdown={breakdown} lastRequest={lastUsage} />
+                  <ContextMeter
+                    breakdown={breakdown}
+                    lastRequest={lastUsage}
+                    compacted={s.compaction && (s.compaction.summary || s.compaction.dropResultsBefore) ? s.compaction : null}
+                    canCompact={!busy && messages.length > 0}
+                    onCompact={() => void ctl.compactNow(chatId)}
+                  />
                 </div>
               </div>
             </form>
@@ -1277,6 +1264,42 @@ export default function App() {
           />
         )}
       </SidebarProvider>
+              <SettingsDialog
+                open={settingsOpen}
+                onOpenChange={setSettingsOpen}
+                polish={polishOn}
+                onPolishChange={(on) => {
+                  setPolishOn(on);
+                  setSetting("polish", on);
+                }}
+                autoCompact={autoCompactOn}
+                onAutoCompactChange={(on) => {
+                  setAutoCompactOn(on);
+                  setSetting("autoCompact", on);
+                }}
+                notifyOn={notifyOn}
+                onNotifyChange={(on) => {
+                  setNotifyOn(on);
+                  setSetting("notifyOn", on);
+                }}
+                branchPerChat={branchPerChat}
+                onBranchPerChatChange={(on) => {
+                  setBranchPerChat(on);
+                  setSetting("gitBranchPerChat", on);
+                }}
+                redact={redactOn}
+                onRedactChange={(on) => {
+                  setRedactOn(on);
+                  setSetting("redact", on);
+                }}
+                limits={limits}
+                onChange={(l) => {
+                  setLimits(l);
+                  setSetting("limits", l);
+                }}
+              />
+              
+
 
       <AlertDialog open={regenChoice !== null} onOpenChange={(open) => !open && setRegenChoice(null)}>
         <AlertDialogContent>

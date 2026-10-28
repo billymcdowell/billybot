@@ -1,3 +1,4 @@
+import { Button } from "@/components/ui/button";
 import { InputGroupButton } from "@/components/ui/input-group";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
@@ -6,6 +7,9 @@ import { formatTokens, type ContextBreakdown, type ContextPart } from "./context
 type Props = {
   breakdown: ContextBreakdown;
   lastRequest: { promptTokens: number; completionTokens: number } | null; // exact, from the API
+  compacted: { tokensBefore?: number; tokensAfter?: number } | null; // set when older messages are shown to the model as a summary
+  canCompact: boolean;
+  onCompact: () => void;
 };
 
 const COLORS: Record<ContextPart["id"], string> = {
@@ -21,7 +25,7 @@ const percent = (n: number, of: number) => (of > 0 ? (n / of) * 100 : 0);
 const shown = (p: number) => (p >= 10 || p === 0 ? Math.round(p) : Number(p.toFixed(1)));
 
 /** A small ring in the prompt bar that opens a breakdown of what fills the model's context. */
-export default function ContextMeter({ breakdown, lastRequest }: Props) {
+export default function ContextMeter({ breakdown, lastRequest, compacted, canCompact, onCompact }: Props) {
   const { parts, used, window, free } = breakdown;
   const usedPct = window ? percent(used, window) : null;
   const barTotal = window ?? used; // without a known window, the bar shows only the split of what's used
@@ -91,6 +95,21 @@ export default function ContextMeter({ breakdown, lastRequest }: Props) {
             This conversation is getting full. Start a new chat before the model begins to lose track or errors out.
           </p>
         )}
+
+        <div className="flex flex-col gap-2 border-t pt-2 text-xs text-muted-foreground">
+          {compacted && (
+            <p>
+              Older messages are shown to the model as a summary
+              {compacted.tokensBefore && compacted.tokensAfter
+                ? ` (about ${compacted.tokensAfter.toLocaleString("en-US")} tokens instead of ${compacted.tokensBefore.toLocaleString("en-US")})`
+                : ""}
+              . They stay on screen.
+            </p>
+          )}
+          <Button size="xs" variant="outline" disabled={!canCompact} onClick={onCompact} title="Replace the oldest messages, for the model, with a summary. You can also type /compact.">
+            Summarize earlier messages
+          </Button>
+        </div>
 
         <div className="flex flex-col gap-1 border-t pt-2 text-xs text-muted-foreground">
           {lastRequest ? (

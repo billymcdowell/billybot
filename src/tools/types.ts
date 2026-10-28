@@ -1,5 +1,6 @@
 import type { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/chat/completions";
 import type { ActivityDraft } from "../activity";
+import type { Compaction } from "../compaction";
 import type { UsageEvent } from "../cost";
 import type { Todo } from "../todos";
 import type { Limits } from "../limits";
@@ -42,6 +43,12 @@ export type AgentOptions = {
   subagentCallId?: string;
   // A subagent registers a way to stop just itself (null when it ends).
   registerSubagent?: (callId: string, stop: (() => void) | null) => void;
+  // Making room when the conversation outgrows the model's context window (main agent only):
+  compaction?: Compaction | null; // what has been compacted already
+  contextWindow?: number; // the model's window in tokens, if known
+  compactAt?: number; // the share of the window (0 to 1) at which to compact; default 0.8
+  // Summarizes the older messages. Returns the new compaction, or null if there was nothing to do.
+  compact?: (messages: ChatCompletionMessageParam[], current: Compaction | null) => Promise<Compaction | null>;
   redact?: boolean; // hide secrets from the model (default true)
   limits?: Partial<Limits>; // see src/limits.ts; missing values use the defaults
   role?: AgentRole;

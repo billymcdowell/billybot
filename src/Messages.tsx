@@ -1,4 +1,4 @@
-import { useEffect, useState, type ElementType } from "react";
+import { Fragment, useEffect, useState, type ElementType } from "react";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import {
   AsteriskIcon,
@@ -44,6 +44,7 @@ import {
 import { textOf } from "./agent";
 import Markdown from "./Markdown";
 import { formatDuration } from "./activity";
+import type { Compaction } from "./compaction";
 import { formatCost } from "./cost";
 import type { SubagentRun } from "./storage";
 
@@ -167,6 +168,30 @@ function Transcript({ messages, streaming }: { messages: Msg[]; streaming?: stri
   );
 }
 
+/** Where the model's view of the conversation changes: older messages stay on screen, but it sees a summary of them. */
+function SummaryDivider({ compaction }: { compaction: Compaction }) {
+  const hasSummary = compaction.summary.trim().length > 0;
+  const saved =
+    compaction.tokensBefore && compaction.tokensAfter
+      ? ` The model now sees about ${compaction.tokensAfter.toLocaleString("en-US")} tokens instead of ${compaction.tokensBefore.toLocaleString("en-US")}.`
+      : "";
+  return (
+    <div className="rounded-md border border-dashed bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+      <details>
+        <summary className="cursor-pointer">
+          {hasSummary ? "Messages above were summarized for the model to save space." : "Old tool results above were hidden from the model to save space."}
+          {saved} Every message is still here.
+        </summary>
+        {hasSummary && (
+          <div className="mt-2 border-t pt-2 text-foreground">
+            <Markdown>{compaction.summary}</Markdown>
+          </div>
+        )}
+      </details>
+    </div>
+  );
+}
+
 /**
  * The Subagent pattern: a line for the run that shows how it is going (time, tool calls, cost);
  * open it to watch the transcript, live while it works. While it runs there is a Stop for just this agent.
@@ -229,6 +254,7 @@ type Props = {
   turnCosts?: Record<string, number>; // dollars per turn, keyed by the index of the turn's user message
   changedTurns?: Record<string, number>; // files each turn changed, which can be undone
   onRevert?: (turn: number) => void;
+  compaction?: Compaction | null; // the model sees a summary in place of the earlier messages, which stay shown
   onStopSubagent?: (callId: string) => void;
   waitingSubagents?: Set<string>; // subagents with something waiting on you
   busy?: boolean; // hides the per-message actions while the agent works
@@ -252,6 +278,7 @@ export default function MessageList({
   turnCosts = {},
   changedTurns = {},
   onRevert,
+  compaction,
   onStopSubagent,
   waitingSubagents,
   busy = false,
@@ -270,6 +297,7 @@ export default function MessageList({
         <MessageScrollerViewport>
           <MessageScrollerContent className="mx-auto w-full max-w-3xl gap-6 p-4">
             {messages.map((m, i) => {
+              const node = ((): React.ReactNode => {
               if (m.role === "user") {
                 turn = i;
                 const isEditing = editing?.index === i;
@@ -379,6 +407,14 @@ export default function MessageList({
                     </MessageContent>
                   </Message>
                 </MessageScrollerItem>
+              );
+              })();
+              const earlier = compaction !== null && compaction !== undefined && i < compaction.upTo;
+              return (
+                <Fragment key={i}>
+                  {compaction && i === compaction.upTo && <SummaryDivider compaction={compaction} />}
+                  {earlier ? <div className="opacity-70">{node}</div> : node}
+                </Fragment>
               );
             })}
             {streaming && (

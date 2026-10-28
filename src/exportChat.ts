@@ -52,7 +52,12 @@ export function chatToMarkdown(c: Conversation, o: ExportOptions): string {
   ].filter(Boolean);
   out.push(`*${facts.join(" · ")}*`);
 
-  for (const m of c.messages) {
+  c.messages.forEach((m, index) => {
+    if (c.compaction && index === c.compaction.upTo && c.compaction.summary.trim()) {
+      out.push(
+        `<details>\n<summary>From here on, the model saw a summary of the messages above instead of the messages themselves.</summary>\n\n${redactText(c.compaction.summary)}\n\n</details>`,
+      );
+    }
     if (m.role === "user") {
       out.push(`## You\n\n${redactText(textOf(m.content))}`);
     } else if (m.role === "assistant") {
@@ -71,7 +76,7 @@ export function chatToMarkdown(c: Conversation, o: ExportOptions): string {
       }
       if (parts.length) out.push(`## Assistant\n\n${parts.join("\n\n")}`);
     }
-  }
+  });
   return out.join("\n\n") + "\n";
 }
 
@@ -86,8 +91,8 @@ export function chatToJson(c: Conversation, o: ExportOptions): string {
       { ...run, messages: run.messages.map((m) => (m.role === "tool" && typeof m.content === "string" ? { ...m, content: shorten(m.content, o.fullToolOutput) } : m)) },
     ]),
   );
-  const { title, id, updatedAt, projects, usage } = c;
-  return JSON.stringify(redactDeep({ title, id, updatedAt, projects, usage, messages, subagents }), null, 2) + "\n";
+  const { title, id, updatedAt, projects, usage, compaction } = c;
+  return JSON.stringify(redactDeep({ title, id, updatedAt, projects, usage, compaction, messages, subagents }), null, 2) + "\n";
 }
 
 /** A file name from the chat's title: letters, digits, spaces turned to dashes. */

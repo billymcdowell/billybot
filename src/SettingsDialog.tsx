@@ -1,10 +1,12 @@
-import { SlidersHorizontalIcon } from "lucide-react";
+import { MonitorIcon, MoonIcon, SunIcon } from "lucide-react";
+import { useTheme } from "next-themes";
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
-import { Popover, PopoverContent, PopoverDescription, PopoverHeader, PopoverTitle, PopoverTrigger } from "@/components/ui/popover";
 import { DEFAULT_LIMITS, LIMIT_BOUNDS, resolveLimits, type Limits } from "./limits";
 
 const FIELDS: { key: keyof Limits; label: string; unit: string }[] = [
@@ -14,12 +16,23 @@ const FIELDS: { key: keyof Limits; label: string; unit: string }[] = [
   { key: "outputTailChars", label: "Command output: keep the end", unit: "characters" },
   { key: "maxResultChars", label: "Largest tool result", unit: "characters" },
   { key: "budgetUsd", label: "Budget for each chat (0 = none)", unit: "dollars" },
+  { key: "compactAtPercent", label: "Summarize old messages when the chat is this full", unit: "% of window" },
   { key: "maxConcurrentRuns", label: "Chats that may work at once", unit: "chats" },
   { key: "checkpointDays", label: "Keep undo copies for", unit: "days" },
   { key: "checkpointMb", label: "Undo copies may take up to", unit: "MB" },
 ];
 
+const THEMES = [
+  { id: "system", label: "System", icon: MonitorIcon },
+  { id: "light", label: "Light", icon: SunIcon },
+  { id: "dark", label: "Dark", icon: MoonIcon },
+];
+
 type Props = {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  polish: boolean;
+  onPolishChange: (on: boolean) => void;
   limits: Limits;
   onChange: (limits: Limits) => void;
   redact: boolean;
@@ -28,10 +41,13 @@ type Props = {
   onBranchPerChatChange: (on: boolean) => void;
   notifyOn: boolean;
   onNotifyChange: (on: boolean) => void;
+  autoCompact: boolean;
+  onAutoCompactChange: (on: boolean) => void;
 };
 
-/** Header menu for the limits in src/limits.ts. A value is applied (and clamped) when you leave its box. */
-export default function LimitsPopover({ limits, onChange, redact, onRedactChange, branchPerChat, onBranchPerChatChange, notifyOn, onNotifyChange }: Props) {
+/** Global settings: appearance, dictation and the limits in src/limits.ts. A limit is applied (and clamped) when you leave its box. */
+export default function SettingsDialog({ open, onOpenChange, polish, onPolishChange, limits, onChange, redact, onRedactChange, branchPerChat, onBranchPerChatChange, notifyOn, onNotifyChange, autoCompact, onAutoCompactChange }: Props) {
+  const { theme = "system", setTheme } = useTheme();
   const [draft, setDraft] = useState<Record<string, string>>({});
   useEffect(() => setDraft({}), [limits]);
 
@@ -44,20 +60,32 @@ export default function LimitsPopover({ limits, onChange, redact, onRedactChange
   }
 
   return (
-    <Popover>
-      <PopoverTrigger asChild>
-        <Button size="icon-xs" variant="outline" aria-label="Limits" title="Limits">
-          <SlidersHorizontalIcon />
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent align="end" className="w-80">
-        <PopoverHeader>
-          <PopoverTitle>Limits</PopoverTitle>
-          <PopoverDescription>
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Settings</DialogTitle>
+          <DialogDescription>
             Longer results use more of the model's context. Changes apply from the next message.
-          </PopoverDescription>
-        </PopoverHeader>
+          </DialogDescription>
+        </DialogHeader>
         <div className="flex flex-col gap-3">
+          <div className="flex items-center justify-between gap-3">
+            <Label>Theme</Label>
+            <ToggleGroup type="single" variant="outline" size="sm" value={theme} onValueChange={(v) => v && setTheme(v)}>
+              {THEMES.map(({ id, label, icon: Icon }) => (
+                <ToggleGroupItem key={id} value={id} aria-label={label}>
+                  <Icon /> {label}
+                </ToggleGroupItem>
+              ))}
+            </ToggleGroup>
+          </div>
+          <div className="flex items-start gap-3">
+            <Switch id="polish" checked={polish} onCheckedChange={onPolishChange} />
+            <div className="flex flex-col gap-0.5">
+              <Label htmlFor="polish">Polish dictation</Label>
+              <span className="text-xs text-muted-foreground">A quick model pass tidies up what you dictate before it is sent.</span>
+            </div>
+          </div>
           {FIELDS.map(({ key, label, unit }) => (
             <div key={key} className="flex flex-col gap-1">
               <Label htmlFor={`limit-${key}`}>{label}</Label>
@@ -88,6 +116,16 @@ export default function LimitsPopover({ limits, onChange, redact, onRedactChange
             </div>
           </div>
           <div className="flex items-start gap-3">
+            <Switch id="compact" checked={autoCompact} onCheckedChange={onAutoCompactChange} />
+            <div className="flex flex-col gap-0.5">
+              <Label htmlFor="compact">Summarize old messages automatically</Label>
+              <span className="text-xs text-muted-foreground">
+                When a chat fills the model's window, the oldest messages are replaced, for the model only, by a summary. Every message stays on
+                screen. It costs one extra model call, counted in the chat's cost.
+              </span>
+            </div>
+          </div>
+          <div className="flex items-start gap-3">
             <Switch id="notify" checked={notifyOn} onCheckedChange={onNotifyChange} />
             <div className="flex flex-col gap-0.5">
               <Label htmlFor="notify">Notify me when a chat finishes or needs me</Label>
@@ -110,7 +148,7 @@ export default function LimitsPopover({ limits, onChange, redact, onRedactChange
             Reset to defaults
           </Button>
         </div>
-      </PopoverContent>
-    </Popover>
+      </DialogContent>
+    </Dialog>
   );
 }

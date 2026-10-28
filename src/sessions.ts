@@ -10,6 +10,7 @@ import { useSyncExternalStore } from "react";
 import { makeEvent, mergeEvents, upsertEvent, type ActivityDraft, type ActivityEvent } from "./activity";
 import { runAgent } from "./agent";
 import { changedByTurn, runsFrom, summarizeRevert, type CheckpointRun, type RevertResult } from "./checkpoints";
+import { compactionFor, fallbackCompaction, keepTokensFor, messagesTokens, planCompaction, view, type Compaction } from "./compaction";
 import { addUsage, budgetState, effectiveCap, emptyUsage, formatCost, type ChatUsage } from "./cost";
 import type { GitInfo } from "./git";
 import { branchName, isChatBranch, isShowable } from "./git";
@@ -19,6 +20,8 @@ import {
 import type { Limits } from "./limits";
 import type { ModelInfo } from "./models";
 import { MODES, type Approval, type ApprovalRequest } from "./permissions";
+import type { Summary } from "./summarize";
+import { summarize } from "./summarize";
 import type { Todo } from "./todos";
 import type { Conversation, Mode, OpenProject, SubagentRun } from "./storage";
 import type { AgentOptions } from "./tools/types";
@@ -64,6 +67,8 @@ export type Session = {
   approvals: Pending[];
   questions: Question[];
   todos: Todo[]; // the agent's to-do list
+  /** The model sees a summary in place of the first `upTo` messages. The messages themselves are all still here. */
+  compaction: Compaction | null;
   phase: Phase;
   stopped: boolean; // the last run ended because Stop was pressed
   closedMidRun: boolean; // the app was closed while this chat was working
@@ -93,7 +98,7 @@ export const titleOf = (s: Pick<Session, "meta" | "messages">) =>
 export function blankSession(id: string, mode: Mode, now: number): Session {
   return {
     id, meta: {}, messages: [], projects: [], subagents: {}, streaming: "", usage: emptyUsage(), lastUsage: null, events: [],
-    queue: [], runs: [], changed: {}, approvals: [], questions: [], todos: [], phase: "idle", stopped: false, closedMidRun: false, error: "", notice: "",
+    queue: [], runs: [], changed: {}, approvals: [], questions: [], todos: [], compaction: null, phase: "idle", stopped: false, closedMidRun: false, error: "", notice: "",
     mode, draft: "", attention: null, touched: now, updatedAt: now,
   };
 }
@@ -138,6 +143,7 @@ export function toConversation(s: Session, updatedAt: number): Conversation {
     checkpoints: s.runs,
     mode: s.mode,
     todos: s.todos,
+    compaction: s.compaction,
   };
 }
 
@@ -225,6 +231,8 @@ export type Deps = {
   notify: (title: string, body: string) => void;
   now: () => number;
   newId: () => string;
+  summarize: (opts: Parameters<typeof summarize>[0]) => Promise<Summary>;
+  autoCompact: () => boolean;
 };
 
 type ActiveRun = { abort: AbortController; runKey: string };
@@ -286,6 +294,7 @@ export class SessionController {
       closedMidRun: fixed.repaired || subs.repaired,
       mode: c.mode ?? this.deps.defaultMode(),
       todos: c.todos ?? [],
+      compaction: c.compaction ?? null,
       updatedAt: c.updatedAt,
     };
     this.store.put(s);
@@ -572,6 +581,12 @@ export class SessionController {
     const s = this.store.get(id);
     const t = text.trim();
     if (!s || !t) return;
+    if (t === "/compact") {
+      this.store.update(id, { draft: "" });
+      if (isBusy(s)) this.setNotice(id, "Wait for the agent to finish, then try /compact again.");
+      else void this.compactNow(id);
+      return;
+    }
     this.store.update(id, { draft: "", ...(isBusy(s) ? {} : { notice: "" }) });
     if (isBusy(s)) this.enqueue(id, t);
     else void this.run(id, [...s.messages, { role: "user", content: t }]);
@@ -625,6 +640,7 @@ export class SessionController {
     const now = this.store.get(id);
     if (!now || isBusy(now)) return;
     const kept = now.messages.slice(0, at + 1);
+    this.store.update(id, { compaction: compactionFor(now.compaction, kept.length) });
     void this.run(id, kept, { subagents: this.subagentsFor(now, kept) });
   }
 
@@ -636,6 +652,7 @@ export class SessionController {
     const now = this.store.get(id);
     if (!now || isBusy(now)) return;
     const kept = now.messages.slice(0, index);
+    this.store.update(id, { compaction: compactionFor(now.compaction, kept.length) });
     void this.run(id, [...kept, { role: "user", content: text }], { subagents: this.subagentsFor(now, kept) });
   }
 
@@ -652,6 +669,7 @@ export class SessionController {
       usage: emptyUsage(),
       forkedFrom: { chatId: s.id, messageIndex },
       mode: s.mode,
+      compaction: compactionFor(s.compaction, kept.length),
     };
   }
 
@@ -678,6 +696,84 @@ export class SessionController {
     const created = this.ensure(fork);
     void this.run(created.id, [...kept, { role: "user", content: text }], { subagents: fork.subagents });
     return created.id;
+  }
+
+  // ----- making room -----
+
+  /**
+   * Replaces the oldest messages, as far as the model is concerned, with a summary (see compaction.ts).
+   * If a summary can't be made it hides old tool results instead. Returns the new compaction, or null.
+   */
+  private async compactSession(id: string, signal: AbortSignal | undefined, messagesNow?: Msg[]): Promise<Compaction | null> {
+    const s = this.store.get(id);
+    const apiKey = this.deps.apiKey();
+    if (!s || !apiKey) return null;
+    const messages = messagesNow ?? s.messages;
+    const model = this.deps.model();
+    const window = this.deps.modelInfo(model)?.contextLength ?? null;
+    const before = messagesTokens(view(messages, s.compaction));
+    const now = this.deps.now();
+    const plan = planCompaction(messages, s.compaction, keepTokensFor(window));
+    const turn = messages.map((m) => m.role).lastIndexOf("user");
+    const ref = `compact-${id}-${now}`;
+
+    const finish = (next: Compaction, how: string, level: "info" | "warn" = "info") => {
+      const done: Compaction = { ...next, tokensBefore: before, tokensAfter: messagesTokens(view(messages, next)) };
+      this.store.update(id, { compaction: done });
+      const text = `${how}: the model now sees about ${done.tokensAfter!.toLocaleString("en-US")} tokens instead of ${before.toLocaleString("en-US")}`;
+      this.emit(id, { category: "chat", ref, level, summary: text, detail: { upTo: done.upTo, tokensBefore: before, tokensAfter: done.tokensAfter } });
+      this.setNotice(id, text + ". Every message is still here.");
+      void this.saveNow(id);
+      return done;
+    };
+    // No summary possible (nothing old enough, or the call failed): hide old tool results instead.
+    const hideResults = (why: string) => {
+      const target = window ? Math.floor(window * 0.6) : keepTokensFor(null) * 2;
+      const fallback = fallbackCompaction(messages, s.compaction, target, now);
+      if (!fallback) {
+        this.emit(id, { category: "chat", ref, level: "warn", summary: `${why}, and there was nothing to hide either` });
+        return null;
+      }
+      return finish(fallback, `${why}. Old tool results were hidden from the model instead`, "warn");
+    };
+
+    if (!plan) return window && before / window >= 0.9 ? hideResults("Nothing old enough to summarize") : null;
+
+    this.emit(id, { category: "chat", ref, pending: true, summary: `Summarizing ${plan.slice.length} earlier messages to make room`, detail: { messages: plan.slice.length, tokensBefore: before } });
+    try {
+      const result = await this.deps.summarize({ apiKey, model, previous: s.compaction?.summary ?? "", slice: plan.slice, todos: s.todos, signal });
+      this.store.update(id, (cur) => ({
+        usage: addUsage(cur.usage, { model, role: "main", who: "Summary", promptTokens: result.promptTokens, completionTokens: result.completionTokens, cost: result.cost }, this.deps.modelInfo(model), turn),
+      }));
+      return finish({ upTo: plan.cut, summary: result.text, at: now }, `Summarized ${plan.slice.length} earlier messages`);
+    } catch (e) {
+      if (signal?.aborted) {
+        this.emit(id, { category: "chat", ref, level: "warn", summary: "Summarizing was stopped" });
+        return null;
+      }
+      return hideResults(`Couldn't summarize (${e instanceof Error ? e.message : String(e)})`);
+    }
+  }
+
+  /** "Summarize earlier messages" and /compact: do it now, without sending anything. */
+  async compactNow(id: string) {
+    const s = this.store.get(id);
+    if (!s || isBusy(s)) return;
+    if (s.messages.length === 0) {
+      this.setNotice(id, "There's nothing to summarize yet.");
+      return;
+    }
+    const abort = new AbortController();
+    this.active.set(id, { abort, runKey: this.deps.newId() });
+    this.store.update(id, { phase: "running", streaming: "Summarizing earlier messages…", error: "", notice: "" });
+    try {
+      const next = await this.compactSession(id, abort.signal);
+      if (!next && !abort.signal.aborted) this.setNotice(id, "There's nothing worth summarizing yet. The conversation is still short.");
+    } finally {
+      this.active.delete(id);
+      this.store.update(id, { phase: "idle", streaming: "", approvals: [] });
+      await this.saveNow(id).catch(() => {});
+    }
   }
 
   // ----- undo -----
@@ -826,6 +922,10 @@ export class SessionController {
         runKey,
         checkpoint: { chatId: id, runId },
         beforeWrite: (project) => this.prepareBranch(id, project),
+        compaction: this.store.get(id)?.compaction ?? null,
+        contextWindow: this.deps.modelInfo(model)?.contextLength ?? undefined,
+        compactAt: limits.compactAtPercent / 100,
+        ...(this.deps.autoCompact() ? { compact: (msgs: Msg[]) => this.compactSession(id, controller.signal, msgs) } : {}),
         messages: history,
         ask: this.ask(id),
         askUser: this.askUser(id),
@@ -960,6 +1060,8 @@ export function createController(deps: Partial<Deps> & Pick<Deps, "workspace" | 
     notify: () => {},
     now: () => Date.now(),
     newId: () => crypto.randomUUID(),
+    summarize,
+    autoCompact: () => true,
     ...deps,
   };
   return new SessionController(store, full);

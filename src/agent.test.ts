@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { ChatCompletionMessageParam as Msg } from "openai/resources/chat/completions";
 import { call, fakeClient, recordingAsk, say, useTools, type Reply } from "./test/helpers";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -1051,5 +1052,104 @@ describe("stopping one subagent", () => {
     const { ask, asked } = recordingAsk("once");
     await run([useTools(call("write_file", { path: "app/a", content: "x" })), say("ok")], { ask }, "ask");
     expect(asked[0].owner).toBeUndefined();
+  });
+});
+
+describe("making room in a long conversation", () => {
+  const long = (n: number): Msg[] => {
+    const out: Msg[] = [{ role: "user", content: "big job" }];
+    for (let i = 0; i < n; i++) {
+      out.push({ role: "assistant", content: null, tool_calls: [{ id: `h${i}`, type: "function", function: { name: "read_file", arguments: "{}" } }] });
+      out.push({ role: "tool", tool_call_id: `h${i}`, content: `result ${i}` });
+    }
+    return out;
+  };
+  const compactTo = (upTo: number) => ({ upTo, summary: "Earlier work summarized.", at: 1 });
+
+  it("asks for a summary when the last request filled enough of the window, and sends the summary instead of the old messages", async () => {
+    const compact = vi.fn(async () => compactTo(9));
+    const history = long(6); // 13 messages
+    client = fakeClient([{ ...useTools(call("list_projects")), usage: { prompt: 17_000, completion: 5 } }, say("done")]);
+    backend({ list_projects: () => [] });
+    await runAgent(options({ messages: history, compact, contextWindow: 20_000, compactAt: 0.8 }));
+    // first request: nothing is known yet, and a short history is far from full
+    expect(compact).toHaveBeenCalledTimes(1);
+    const second = client.requests[1].messages;
+    expect(second[0].role).toBe("system");
+    expect(String(second[1].content)).toContain("Earlier work summarized.");
+    expect(second).toHaveLength(1 + 1 + (history.length + 2 - 9)); // system + summary + the messages from the cut on
+    expect(JSON.stringify(second)).not.toContain("result 0");
+    expect(JSON.stringify(second)).toContain("result 5");
+  });
+
+  it("doesn't ask while there is plenty of room", async () => {
+    const compact = vi.fn(async () => compactTo(3));
+    client = fakeClient([{ ...useTools(call("list_projects")), usage: { prompt: 5_000, completion: 5 } }, { ...say("done"), usage: { prompt: 6_000, completion: 5 } }]);
+    backend({ list_projects: () => [] });
+    await runAgent(options({ compact, contextWindow: 20_000 }));
+    expect(compact).not.toHaveBeenCalled();
+  });
+
+  it("estimates when it has no usage figure yet, so a chat that is already huge is compacted before its first request", async () => {
+    const compact = vi.fn(async () => compactTo(2));
+    const history: Msg[] = [{ role: "user", content: "x".repeat(40_000) }, { role: "assistant", content: "ok" }, { role: "user", content: "next" }];
+    client = fakeClient([say("done")]);
+    await runAgent(options({ messages: history, compact, contextWindow: 10_000 }));
+    expect(compact).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(client.requests[0].messages)).not.toContain("xxxxxxxx");
+  });
+
+  it("uses a compaction it was given from the start, without asking again", async () => {
+    const compact = vi.fn(async () => null);
+    const history = long(4);
+    client = fakeClient([say("done")]);
+    await runAgent(options({ messages: history, compaction: compactTo(5), compact, contextWindow: 1_000_000 }));
+    expect(String(client.requests[0].messages[1].content)).toContain("Earlier work summarized.");
+    expect(client.requests[0].messages).toHaveLength(1 + 1 + (history.length - 5));
+  });
+
+  it("keeps the full history in what it returns", async () => {
+    const history = long(6);
+    client = fakeClient([say("done")]);
+    const out = await runAgent(options({ messages: history, compaction: compactTo(9), contextWindow: 1_000_000 }));
+    expect(out.slice(0, history.length)).toEqual(history);
+    expect(last(out)).toEqual({ role: "assistant", content: "done" });
+  });
+
+  it("doesn't keep trying every step when there's nothing worth summarizing", async () => {
+    const compact = vi.fn(async () => null);
+    client = fakeClient([
+      { ...useTools(call("list_projects")), usage: { prompt: 19_000, completion: 1 } },
+      { ...useTools(call("list_projects")), usage: { prompt: 19_000, completion: 1 } },
+      { ...useTools(call("list_projects")), usage: { prompt: 19_000, completion: 1 } },
+      say("done"),
+    ]);
+    backend({ list_projects: () => [] });
+    await runAgent(options({ compact, contextWindow: 20_000 }));
+    expect(compact.mock.calls.length).toBeLessThanOrEqual(2);
+    expect(compact.mock.calls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("is for the main agent only", async () => {
+    const compact = vi.fn(async () => compactTo(2));
+    const replies = [say("done")];
+    client = fakeClient([], () => replies.shift()!);
+    await runAgent(options({ role: "sub", who: "app agent", messages: long(10), compact, contextWindow: 100 }));
+    expect(compact).not.toHaveBeenCalled();
+  });
+
+  it("does nothing when it can't know the window", async () => {
+    const compact = vi.fn(async () => compactTo(2));
+    client = fakeClient([say("done")]);
+    await runAgent(options({ messages: long(10), compact }));
+    expect(compact).not.toHaveBeenCalled();
+  });
+
+  it("tells subagents nothing about it, even when the main agent has a compaction", async () => {
+    backend({ check_project: () => undefined });
+    const compact = vi.fn(async () => compactTo(2));
+    await run([useTools(call("delegate_task", { project: "app", task: "t" })), say("ok")], { compact, contextWindow: 10, compaction: compactTo(0) }, "bypass", () => say("done"));
+    const subRequest = client.requests.find((r) => String(r.messages[0].content).includes("You are a subagent"))!;
+    expect(JSON.stringify(subRequest.messages)).not.toContain("summarized to save space");
   });
 });

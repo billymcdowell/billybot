@@ -104,3 +104,31 @@ describe("exportFileName", () => {
     expect(exportFileName("日本語", "md")).toBe("chat.md");
   });
 });
+
+describe("a chat whose older messages were summarized", () => {
+  const messages: Msg[] = [
+    { role: "user", content: "first request" }, { role: "assistant", content: "first answer" },
+    { role: "user", content: "second request" }, { role: "assistant", content: "second answer" },
+  ];
+  const compaction = { upTo: 2, summary: "They asked for a thing; key sk-or-v1-0123456789abcdef0123456789abcdef.", at: 1 };
+
+  it("keeps every message and says where the model's view changes, with the summary", () => {
+    const md = chatToMarkdown({ ...chat(messages), compaction }, opts);
+    expect(md).toContain("first request");
+    expect(md).toContain("second answer");
+    const marker = md.indexOf("the model saw a summary of the messages above");
+    expect(marker).toBeGreaterThan(md.indexOf("first answer"));
+    expect(marker).toBeLessThan(md.indexOf("second request"));
+    expect(md).toContain("They asked for a thing");
+    expect(md).not.toContain("0123456789abcdef");
+  });
+
+  it("puts the compaction in the JSON, redacted, and nothing about it in a chat without one", () => {
+    const withIt = JSON.parse(chatToJson({ ...chat(messages), compaction }, opts));
+    expect(withIt.messages).toHaveLength(4);
+    expect(withIt.compaction.upTo).toBe(2);
+    expect(JSON.stringify(withIt)).not.toContain("0123456789abcdef");
+    expect(chatToMarkdown(chat(messages), opts)).not.toContain("summary of the messages above");
+    expect(JSON.parse(chatToJson(chat(messages), opts)).compaction).toBeUndefined();
+  });
+});

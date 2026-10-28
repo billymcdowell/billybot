@@ -45,3 +45,12 @@ describe("running chats at once", () => {
     expect(resolveLimits({ maxConcurrentRuns: 2.6 }).maxConcurrentRuns).toBe(3);
   });
 });
+
+describe("when to summarize", () => {
+  it("defaults to 80% of the window and stays between 30 and 95", () => {
+    expect(DEFAULT_LIMITS.compactAtPercent).toBe(80);
+    expect(resolveLimits({ compactAtPercent: 5 }).compactAtPercent).toBe(30);
+    expect(resolveLimits({ compactAtPercent: 100 }).compactAtPercent).toBe(95);
+    expect(resolveLimits({ compactAtPercent: 72.4 }).compactAtPercent).toBe(72);
+  });
+});

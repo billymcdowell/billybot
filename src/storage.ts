@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { LazyStore } from "@tauri-apps/plugin-store";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import type { ChatUsage } from "./cost";
+import type { Compaction } from "./compaction";
 import type { Todo } from "./todos";
 import { searchableText, snippetAround } from "./history";
 
@@ -47,6 +48,7 @@ export type Conversation = {
   checkpoints?: { run: string; turn: number }[]; // each run that may have changed files, and the turn it answered
   mode?: Mode; // this chat's permission mode; chats saved before modes were per chat have none
   todos?: Todo[]; // the agent's to-do list
+  compaction?: Compaction | null; // older messages the model sees as a summary; the messages themselves are all kept
 };
 
 /** What the sidebar needs about a chat, kept in an index so listing never opens every chat. */

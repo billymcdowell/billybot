@@ -10,6 +10,7 @@ export type Limits = {
   checkpointDays: number; // how long undo copies of the agent's file changes are kept
   checkpointMb: number; // ...and how much room they may take
   maxConcurrentRuns: number; // chats that may have an agent working at once; more wait for a free slot
+  compactAtPercent: number; // summarize older messages when the conversation fills this share of the model's window
 };
 
 export const DEFAULT_LIMITS: Limits = {
@@ -22,6 +23,7 @@ export const DEFAULT_LIMITS: Limits = {
   checkpointDays: 30,
   checkpointMb: 500,
   maxConcurrentRuns: 4,
+  compactAtPercent: 80,
 };
 
 // [min, max] for each. The Rust side enforces the same ceilings.
@@ -35,6 +37,7 @@ export const LIMIT_BOUNDS: Record<keyof Limits, [number, number]> = {
   checkpointDays: [1, 365],
   checkpointMb: [50, 20_000],
   maxConcurrentRuns: [1, 16],
+  compactAtPercent: [30, 95],
 };
 
 /** Fills in anything missing, clamps every value to its bounds, and keeps the default timeout under the maximum. */

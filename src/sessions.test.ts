@@ -1096,3 +1096,250 @@ describe("subagents inside a chat", () => {
     expect(String(store.get("A")!.subagents.d1.messages[1].content)).toBe(big); // what's on screen is whole
   });
 });
+
+describe("making room in a long chat", () => {
+  const bigResult = (n: number) => "x".repeat(n * 4);
+  /** A working session: a request, then rounds of reading files. */
+  const longChat = (rounds = 10, tokens = 1500): Msg[] => {
+    const out: Msg[] = [user("big job")];
+    for (let i = 0; i < rounds; i++) {
+      out.push({ role: "assistant", content: null, tool_calls: [{ id: `c${i}`, type: "function", function: { name: "read_file", arguments: '{"path":"app/a"}' } }] });
+      out.push({ role: "tool", tool_call_id: `c${i}`, content: bigResult(tokens) });
+    }
+    out.push(reply("done for now"));
+    return out;
+  };
+  const stored = (id: string, messages: Msg[], over: Partial<Conversation> = {}): Conversation => ({
+    id, title: "t", updatedAt: 1, messages, projects: [], subagents: {}, ...over,
+  });
+  const summary = (text = "Summary of the work.") =>
+    vi.fn(async (_o: { previous: string; slice: Msg[]; todos?: unknown[] }) => ({ text, promptTokens: 4000, completionTokens: 200, cost: 0.02 }));
+  const win = { modelInfo: () => ({ id: "m", name: "m", contextLength: 40_000, inputPerM: 3, outputPerM: 15 }) };
+
+  it("summarizes the older messages, keeps every message, and counts what the summary cost", async () => {
+    const summarizeFn = summary();
+    const { ctl, store, agent, audit } = setup({ summarize: summarizeFn, ...win });
+    const messages = longChat();
+    ctl.ensure(stored("A", messages, { todos: [{ content: "Finish", status: "in_progress" }] }));
+    ctl.send("A", "carry on");
+    await flush();
+    const compact = agent.calls[0].opts.compact!;
+    const next = await compact(store.get("A")!.messages, null);
+    expect(next).toMatchObject({ summary: "Summary of the work." });
+    expect(next!.upTo).toBeGreaterThan(4);
+    expect(store.get("A")!.compaction).toEqual(next);
+    expect(store.get("A")!.messages.length).toBe(messages.length + 1); // nothing was removed
+    expect(store.get("A")!.usage.cost).toBeCloseTo(0.02);
+    expect(next!.tokensAfter!).toBeLessThan(next!.tokensBefore!);
+
+    const args = summarizeFn.mock.calls[0][0] as { previous: string; slice: Msg[]; todos: unknown[] };
+    expect(args.previous).toBe("");
+    expect(args.slice).toEqual(messages.slice(0, next!.upTo));
+    expect(args.todos).toHaveLength(1);
+    expect(store.get("A")!.notice).toMatch(/Summarized \d+ earlier messages: the model now sees about [\d,]+ tokens instead of [\d,]+\. Every message is still here\./);
+    expect(audit.some((e) => e.summary.startsWith("Summarized"))).toBe(true);
+  });
+
+  it("gives the agent its window, its trigger and the compaction it already has", async () => {
+    const existing = { upTo: 3, summary: "Old summary.", at: 1 };
+    const { ctl, agent } = setup({ ...win }, { compactAtPercent: 70 });
+    ctl.ensure(stored("A", longChat(4), { compaction: existing }));
+    ctl.send("A", "go");
+    await flush();
+    expect(agent.calls[0].opts).toMatchObject({ contextWindow: 40_000, compactAt: 0.7, compaction: existing });
+    expect(agent.calls[0].opts.compact).toBeTypeOf("function");
+  });
+
+  it("builds on an earlier summary, folding in only the messages since", async () => {
+    const summarizeFn = summary("Newer summary.");
+    const { ctl, store, agent } = setup({ summarize: summarizeFn, ...win });
+    const messages = longChat(16);
+    ctl.ensure(stored("A", messages, { compaction: { upTo: 5, summary: "First summary.", at: 1 } }));
+    ctl.send("A", "go");
+    await flush();
+    const next = await agent.calls[0].opts.compact!(store.get("A")!.messages, store.get("A")!.compaction);
+    const args = summarizeFn.mock.calls[0][0] as { previous: string; slice: Msg[] };
+    expect(args.previous).toBe("First summary.");
+    expect(args.slice[0]).toEqual(messages[5]);
+    expect(next!.upTo).toBeGreaterThan(5);
+    expect(store.get("A")!.compaction!.summary).toBe("Newer summary.");
+  });
+
+  it("does nothing, and doesn't call the model, when the chat is short", async () => {
+    const summarizeFn = summary();
+    const { ctl, store, agent } = setup({ summarize: summarizeFn, ...win });
+    ctl.ensure(stored("A", [user("hi"), reply("hello")]));
+    ctl.send("A", "more");
+    await flush();
+    expect(await agent.calls[0].opts.compact!(store.get("A")!.messages, null)).toBeNull();
+    expect(summarizeFn).not.toHaveBeenCalled();
+  });
+
+  it("hides old tool results when the summary can't be made, and never touches your messages", async () => {
+    const { ctl, store, agent } = setup({ summarize: vi.fn(async () => { throw new Error("402 out of credits"); }), ...win });
+    const messages = longChat(30, 1500);
+    ctl.ensure(stored("A", messages));
+    ctl.send("A", "go");
+    await flush();
+    const next = await agent.calls[0].opts.compact!(store.get("A")!.messages, null);
+    expect(next).toMatchObject({ summary: "" });
+    expect(next!.dropResultsBefore).toBeGreaterThan(0);
+    expect(store.get("A")!.notice).toMatch(/Couldn't summarize \(402 out of credits\)\. Old tool results were hidden from the model instead/);
+    expect(store.get("A")!.events.some((e) => e.level === "warn" && e.summary.includes("402 out of credits"))).toBe(true);
+    expect(store.get("A")!.messages.filter((m) => m.role === "user")).toEqual([user("big job"), user("go")]);
+    expect(store.get("A")!.usage.cost).toBe(0); // the failed call cost nothing
+  });
+
+  it("stopping during a summary ends it quietly", async () => {
+    let seen: AbortSignal | undefined;
+    const slow = vi.fn((o: { signal?: AbortSignal }) => new Promise<never>((_, reject) => {
+      seen = o.signal;
+      o.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+    }));
+    const { ctl, store, agent } = setup({ summarize: slow as never, ...win });
+    ctl.ensure(stored("A", longChat()));
+    ctl.send("A", "go");
+    await flush();
+    const pending = agent.calls[0].opts.compact!(store.get("A")!.messages, null);
+    await flush();
+    ctl.stop("A");
+    expect(await pending).toBeNull();
+    expect(seen!.aborted).toBe(true);
+    expect(store.get("A")!.compaction).toBeNull();
+  });
+
+  it("can be switched off", async () => {
+    const { ctl, agent } = setup({ autoCompact: () => false, ...win });
+    ctl.ensure(stored("A", longChat(3)));
+    ctl.send("A", "go");
+    await flush();
+    expect(agent.calls[0].opts.compact).toBeUndefined();
+  });
+
+  it("is saved with the chat and comes back when it is opened", async () => {
+    const { ctl, store, agent, saved } = setup({ summarize: summary(), ...win });
+    ctl.ensure(stored("A", longChat()));
+    ctl.send("A", "go");
+    await flush();
+    await agent.calls[0].opts.compact!(store.get("A")!.messages, null);
+    agent.calls[0].finish();
+    await flush();
+    const last = lastOf(chatsSaved(saved, "A"));
+    expect(last.compaction).toMatchObject({ summary: "Summary of the work." });
+    const { ctl: other } = setup();
+    expect(other.ensure(last).compaction).toEqual(last.compaction);
+  });
+});
+
+describe("summarizing on request", () => {
+  const messages = (): Msg[] => {
+    const out: Msg[] = [user("job")];
+    for (let i = 0; i < 12; i++) {
+      out.push({ role: "assistant", content: null, tool_calls: [{ id: `c${i}`, type: "function", function: { name: "read_file", arguments: "{}" } }] });
+      out.push({ role: "tool", tool_call_id: `c${i}`, content: "y".repeat(6000) });
+    }
+    return out;
+  };
+  const chat = (over = {}): Conversation => ({ id: "A", title: "t", updatedAt: 1, messages: messages(), projects: [], subagents: {}, ...over });
+  const win = { modelInfo: () => ({ id: "m", name: "m", contextLength: 30_000, inputPerM: 0, outputPerM: 0 }) };
+
+  it("summarizes without sending anything to the agent, showing that it's working", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const summarize = vi.fn(async () => { await gate; return { text: "S", promptTokens: 1, completionTokens: 1 }; });
+    const { ctl, store, agent } = setup({ summarize, ...win });
+    ctl.ensure(chat());
+    const done = ctl.compactNow("A");
+    await flush();
+    expect(store.get("A")).toMatchObject({ phase: "running", streaming: "Summarizing earlier messages…" });
+    release();
+    await done;
+    expect(store.get("A")).toMatchObject({ phase: "idle", streaming: "" });
+    expect(store.get("A")!.compaction).toMatchObject({ summary: "S" });
+    expect(agent.runAgent).not.toHaveBeenCalled();
+  });
+
+  it("Stop ends it", async () => {
+    const slow = vi.fn((o: { signal?: AbortSignal }) => new Promise<never>((_, reject) => o.signal?.addEventListener("abort", () => reject(new Error("aborted")))));
+    const { ctl, store } = setup({ summarize: slow as never, ...win });
+    ctl.ensure(chat());
+    const done = ctl.compactNow("A");
+    await flush();
+    ctl.stop("A");
+    await done;
+    expect(store.get("A")).toMatchObject({ phase: "idle", compaction: null, stopped: false });
+  });
+
+  it("says so when there's nothing worth summarizing", async () => {
+    const summarize = vi.fn();
+    const { ctl, store } = setup({ summarize, ...win });
+    ctl.ensure(chat({ messages: [user("hi"), reply("hello")] }));
+    await ctl.compactNow("A");
+    expect(store.get("A")!.notice).toMatch(/nothing worth summarizing/);
+    expect(summarize).not.toHaveBeenCalled();
+    ctl.create("B");
+    await ctl.compactNow("B");
+    expect(store.get("B")!.notice).toMatch(/nothing to summarize yet/);
+  });
+
+  it("is what typing /compact does, and it is not sent to the agent", async () => {
+    const summarize = vi.fn(async () => ({ text: "S", promptTokens: 1, completionTokens: 1 }));
+    const { ctl, store, agent } = setup({ summarize, ...win });
+    ctl.ensure(chat());
+    ctl.setDraft("A", "/compact");
+    ctl.send("A", "  /compact ");
+    await flush();
+    expect(summarize).toHaveBeenCalledOnce();
+    expect(agent.runAgent).not.toHaveBeenCalled();
+    expect(store.get("A")!.draft).toBe("");
+    expect(store.get("A")!.messages).toHaveLength(messages().length);
+  });
+
+  it("while the agent is working, /compact asks you to wait instead of queueing it", async () => {
+    const { ctl, store, agent } = setup({ ...win });
+    ctl.ensure(chat({ messages: [user("a"), reply("b")] }));
+    ctl.send("A", "go");
+    await flush();
+    ctl.send("A", "/compact");
+    expect(store.get("A")!.queue).toEqual([]);
+    expect(store.get("A")!.notice).toMatch(/Wait for the agent to finish/);
+    expect(agent.calls).toHaveLength(1);
+  });
+
+  it("does nothing while the agent is working", async () => {
+    const summarize = vi.fn();
+    const { ctl } = setup({ summarize, ...win });
+    ctl.ensure(chat());
+    ctl.send("A", "go");
+    await flush();
+    await ctl.compactNow("A");
+    expect(summarize).not.toHaveBeenCalled();
+  });
+});
+
+describe("a compaction when the chat is cut back", () => {
+  const msgs = (n: number): Msg[] => Array.from({ length: n }, (_, i) => (i % 2 === 0 ? user(`u${i}`) : reply(`r${i}`)));
+  const chat = (compaction: object): Conversation => ({ id: "A", title: "t", updatedAt: 1, messages: msgs(10), projects: [], subagents: {}, compaction: { at: 1, ...compaction } as never });
+
+  it("a fork keeps it only if the summary is wholly inside what's copied", async () => {
+    const { ctl, store } = setup();
+    ctl.ensure(chat({ upTo: 4, summary: "S" }));
+    const inside = (await ctl.fork("A", 7))!;
+    expect(store.get(inside)!.compaction).toMatchObject({ upTo: 4, summary: "S" });
+    const outside = (await ctl.fork("A", 2))!;
+    expect(store.get(outside)!.compaction).toBeNull();
+  });
+
+  it("regenerating and editing in place do the same", async () => {
+    const { ctl, store } = setup();
+    ctl.ensure(chat({ upTo: 6, summary: "S" }));
+    await ctl.editInPlace("A", 2, "different", false); // keeps messages 0 and 1: the summary covers more than that
+    await flush();
+    expect(store.get("A")!.compaction).toBeNull();
+    const { ctl: other, store: s2 } = setup();
+    other.ensure(chat({ upTo: 2, summary: "S" }));
+    await other.regenerate("A", false); // keeps up to your last message (index 8)
+    await flush();
+    expect(s2.get("A")!.compaction).toMatchObject({ upTo: 2 });
+  });
+});

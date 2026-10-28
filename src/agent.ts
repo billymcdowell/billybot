@@ -5,6 +5,8 @@ import type {
   ChatCompletionMessageParam,
 } from "openai/resources/chat/completions";
 import { summarizeArgs, type ActivityDraft } from "./activity";
+import { messagesTokens, shouldCompact, view } from "./compaction";
+import { estimateTokens } from "./context";
 import { budgetText, stepLimitText } from "./history";
 import { resolveLimits } from "./limits";
 import { clipInstructions, formatInstructions, INSTRUCTIONS_FILE, type ProjectInstructions } from "./instructions";
@@ -228,6 +230,8 @@ async function runSubagent(callId: string, project: string, task: string, o: Age
       onTodos: undefined,
       askUser: undefined,
       registerSubagent: undefined,
+      compact: undefined,
+      compaction: undefined,
       messages: run.messages,
       onUpdate: (msgs, partial) => {
         run.messages = msgs;
@@ -275,6 +279,9 @@ export async function runAgent(o: AgentOptions): Promise<ChatCompletionMessagePa
   const depth = o.role === "sub" ? 1 : 0;
   const emit = (d: ActivityDraft) => o.onEvent?.({ who, depth, ...d });
   const runKey = Math.random().toString(36).slice(2, 8); // makes each request's log row unique
+  let compaction = o.compaction ?? null; // what the model sees in place of the oldest messages
+  let lastPrompt: number | undefined; // what the API said the last request held, in tokens
+  let tryCompactingAt = 0; // don't try again until the conversation has grown to this many messages
 
   for (let step = 0; step < MAX_STEPS; step++) {
     // Stop before spending more if the chat has hit its cap.
@@ -297,6 +304,20 @@ export async function runAgent(o: AgentOptions): Promise<ChatCompletionMessagePa
     // The projects (and so their CLAUDE.md files) can change between steps, so read them each time.
     const instructions = await loadInstructions(o.workspace, o.projects);
     const system: ChatCompletionMessageParam = { role: "system", content: systemPrompt(o, instructions) }; // o.getMode() is read each step, so changing mode takes effect at once
+    // Near the limit of the model's window, older messages are replaced by a summary. The history itself is untouched.
+    if (o.role !== "sub" && o.compact && o.contextWindow && messages.length >= tryCompactingAt) {
+      const used = lastPrompt ?? estimateTokens(String(system.content)) + estimateTokens(JSON.stringify(tools)) + messagesTokens(view(messages, compaction));
+      if (shouldCompact(used, o.contextWindow, o.compactAt)) {
+        const next = await o.compact(messages, compaction);
+        if (next) {
+          compaction = next;
+          lastPrompt = undefined;
+        } else {
+          tryCompactingAt = messages.length + 6; // nothing worth summarizing yet
+        }
+      }
+    }
+
     let text = "";
     const calls: { id: string; name: string; args: string }[] = [];
     const requestRef = `request-${runKey}-${step}`;
@@ -306,12 +327,12 @@ export async function runAgent(o: AgentOptions): Promise<ChatCompletionMessagePa
     emit({
       category: "request", ref: requestRef, pending: true,
       summary: `Asking ${o.model} (step ${step + 1})`,
-      detail: { model: o.model, step: step + 1, messagesSent: messages.length + 1, toolsOffered: tools.length },
+      detail: { model: o.model, step: step + 1, messagesSent: view(messages, compaction).length + 1, toolsOffered: tools.length },
     });
     try {
       const stream = await client.chat.completions.create(
         // `usage.include` asks OpenRouter to report what the request cost.
-        { model: o.model, messages: [system, ...messages], tools, stream: true, usage: { include: true } } as ChatCompletionCreateParamsStreaming,
+        { model: o.model, messages: [system, ...view(messages, compaction)], tools, stream: true, usage: { include: true } } as ChatCompletionCreateParamsStreaming,
         { signal: o.signal },
       );
       for await (const chunk of stream) {
@@ -355,6 +376,7 @@ export async function runAgent(o: AgentOptions): Promise<ChatCompletionMessagePa
       return messages;
     }
     const toolCalls = calls.filter(Boolean);
+    lastPrompt = usage?.input; // none reported: the next check falls back to an estimate
     emit({
       category: "request", ref: requestRef,
       summary: `${o.model} replied: ${toolCalls.length ? `${toolCalls.length} tool ${toolCalls.length === 1 ? "call" : "calls"} (${toolCalls.map((c) => c.name).join(", ")})` : `${text.length.toLocaleString("en-US")} characters of text`}`,
