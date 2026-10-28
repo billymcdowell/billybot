@@ -7,20 +7,21 @@ export const MODES: { id: Mode; label: string }[] = [
   { id: "bypass", label: "Bypass all" },
 ];
 
-// Tools that change something. Everything else is always allowed.
-const WRITE_TOOLS = new Set(["write_file", "edit_file", "create_project"]);
-
-// Tools that run commands. A command can do anything your user account can, and the folder
-// lock doesn't contain it, so these are held to a stricter rule than file edits:
+// Each tool declares a category (see src/tools). Only "write" and "command" can be refused or
+// asked about; "read" and "meta" tools are always allowed.
+//
+// Commands run as anything your user account can, and the folder lock doesn't contain them,
+// so they are held to a stricter rule than file edits:
 //  - Auto-accept still asks. Only Bypass runs them without a prompt.
 //  - "Always allow" is never remembered, since that would approve every future command.
-export const COMMAND_TOOLS = new Set(["run_command"]);
+export type ToolCategory = "read" | "write" | "command" | "meta";
 
 export type Approval = "once" | "always" | "deny";
 
 /** What the approval card shows. */
 export type ApprovalRequest = {
   tool: string;
+  category: ToolCategory;
   args: Record<string, unknown>;
   who: string; // "Main agent" or "bakery-api agent"
   where: string; // the project name, or "workspace" for create_project
@@ -40,8 +41,8 @@ export async function checkPermission(
   scope: string,
   ask: AskFn,
 ): Promise<string | null> {
-  const isCommand = COMMAND_TOOLS.has(req.tool);
-  if (!isCommand && !WRITE_TOOLS.has(req.tool)) return null;
+  const isCommand = req.category === "command";
+  if (!isCommand && req.category !== "write") return null;
   if (mode === "readOnly") return "Read-only mode is on, so changes and commands are disabled.";
   if (mode === "bypass") return null;
   if (mode === "acceptEdits" && !isCommand) return null;

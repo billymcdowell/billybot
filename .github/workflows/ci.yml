@@ -53,6 +53,9 @@ jobs:
 
       - run: npm ci
 
+      - name: Frontend tests
+        run: npm test
+
       # Tauri embeds the built frontend, so this must run before cargo.
       - run: npm run build
 

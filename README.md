@@ -65,7 +65,15 @@ This app lets a language model read and write files and run shell commands on yo
 ## Project layout
 
 - `src/` – React UI and the agent loop (`agent.ts`, `permissions.ts`, `instructions.ts`)
+- `src/tools/` – one module per group of agent tools, a registry (`index.ts`), and the pipeline every tool result passes through (`pipeline.ts`)
 - `src-tauri/src/` – Rust commands for file access, shell, credential storage and Whisper
+
+## Tests
+
+```bash
+npm test                  # frontend (Vitest)
+cd src-tauri && cargo test # Rust
+```
 
 ## License
 
