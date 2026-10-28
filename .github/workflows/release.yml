@@ -25,6 +25,9 @@ jobs:
             args: ""
 
     runs-on: ${{ matrix.platform }}
+    env:
+      # whisper.cpp needs std::filesystem (macOS 10.15+); Tauri's default target is 10.13.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/checkout@v4
 
