@@ -28,3 +28,11 @@ describe("resolveLimits", () => {
     expect(DEFAULT_LIMITS.budgetUsd).toBe(0);
   });
 });
+
+describe("undo copy limits", () => {
+  it("default to 30 days and 500 MB and stay within bounds", () => {
+    expect(DEFAULT_LIMITS).toMatchObject({ checkpointDays: 30, checkpointMb: 500 });
+    expect(resolveLimits({ checkpointDays: 0, checkpointMb: 1 })).toMatchObject({ checkpointDays: 1, checkpointMb: 50 });
+    expect(resolveLimits({ checkpointDays: 9999, checkpointMb: 999_999 })).toMatchObject({ checkpointDays: 365, checkpointMb: 20_000 });
+  });
+});

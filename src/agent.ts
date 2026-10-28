@@ -151,6 +151,13 @@ async function execute(
       if (verdict.decision === "auto") verdict.decision = "refused";
       text = refusal;
     } else {
+      if (tool.category === "write" && target) {
+        try {
+          await o.beforeWrite?.(target.project);
+        } catch {
+          // preparing for the change (such as making a branch) must never stop the change
+        }
+      }
       text = await tool.run(args as Record<string, unknown>, target, { o, callId: call.id, delegateSlot, runSubagent: (id, p, t) => runSubagent(id, p, t, o) });
     }
   } catch (e) {

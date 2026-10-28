@@ -725,3 +725,69 @@ describe("plan mode", () => {
     expect(toolResults(out)[1]).toBe("Wrote");
   });
 });
+
+describe("undo copies", () => {
+  it("sends the run to Rust with every file change", async () => {
+    backend({ write_file: () => "Wrote", edit_file: () => "Edited", multi_edit: () => "Made", read_file: () => null });
+    const checkpoint = { chatId: "chat1", runId: "run1" };
+    const edits = [{ old_text: "a", new_text: "b" }];
+    await run(
+      [useTools(
+        call("write_file", { path: "app/a", content: "x" }, "w"), call("edit_file", { path: "app/a", old_text: "a", new_text: "b" }, "e"),
+        call("multi_edit", { path: "app/a", edits }, "m"),
+      ), say("ok")],
+      { checkpoint },
+    );
+    for (const cmd of ["write_file", "edit_file", "multi_edit"]) {
+      expect(invokeMock).toHaveBeenCalledWith(cmd, expect.objectContaining({ checkpoint }));
+    }
+  });
+
+  it("gives a subagent's writes to the same run", async () => {
+    backend({ check_project: () => undefined, write_file: () => "Wrote", read_file: () => null });
+    const checkpoint = { chatId: "chat1", runId: "run1" };
+    const replies = [useTools(call("write_file", { path: "app/a", content: "x" })), say("done")];
+    await run([useTools(call("delegate_task", { project: "app", task: "t" })), say("ok")], { checkpoint }, "bypass", () => replies.shift()!);
+    expect(invokeMock).toHaveBeenCalledWith("write_file", expect.objectContaining({ checkpoint }));
+  });
+
+  it("tells the model when Rust could not make a copy, as an ordinary error", async () => {
+    backend({ write_file: () => { throw new Error("Couldn't keep an undo copy, so nothing was changed: disk full"); }, read_file: () => null });
+    const out = await run([useTools(call("write_file", { path: "app/a", content: "x" })), say("ok")], { checkpoint: { chatId: "c", runId: "r" } });
+    expect(toolResults(out)[0]).toMatch(/^Error: Couldn't keep an undo copy, so nothing was changed/);
+  });
+});
+
+describe("before a file change", () => {
+  it("tells the app which project is about to change, once per change, after approval", async () => {
+    backend({ write_file: () => "Wrote", edit_file: () => "Edited", read_file: () => null, read_lines: () => "x" });
+    const beforeWrite = vi.fn(async (_p: string) => {});
+    const { ask } = recordingAsk("once");
+    await run(
+      [useTools(call("read_file", { path: "app/a" }, "r"), call("write_file", { path: "app/a", content: "x" }, "w"), call("edit_file", { path: "app/b", old_text: "a", new_text: "b" }, "e")), say("ok")],
+      { beforeWrite, ask }, "ask",
+    );
+    expect(beforeWrite.mock.calls).toEqual([["app"], ["app"]]);
+  });
+
+  it("is not called when the change is denied or refused", async () => {
+    backend({ write_file: () => "Wrote", read_file: () => null });
+    const beforeWrite = vi.fn(async (_p: string) => {});
+    await run([useTools(call("write_file", { path: "app/a", content: "x" })), say("ok")], { beforeWrite, ask: recordingAsk("deny").ask }, "ask");
+    await run([useTools(call("write_file", { path: "app/a", content: "x" })), say("ok")], { beforeWrite }, "plan");
+    expect(beforeWrite).not.toHaveBeenCalled();
+  });
+
+  it("never stops the change if it fails", async () => {
+    backend({ write_file: () => "Wrote", read_file: () => null });
+    const out = await run([useTools(call("write_file", { path: "app/a", content: "x" })), say("ok")], { beforeWrite: async () => { throw new Error("git exploded"); } });
+    expect(toolResults(out)[0]).toBe("Wrote");
+  });
+
+  it("is not called for creating a project, which has no project yet", async () => {
+    backend({ create_project: () => "newapp", check_project: () => undefined });
+    const beforeWrite = vi.fn(async (_p: string) => {});
+    await run([useTools(call("create_project", { name: "newapp" })), say("ok")], { beforeWrite });
+    expect(beforeWrite).not.toHaveBeenCalled();
+  });
+});

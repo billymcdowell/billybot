@@ -6,6 +6,7 @@ import {
   AlertCircleIcon,
   ActivityIcon,
   ArrowUpIcon,
+  GitBranchIcon,
   ChevronDownIcon,
   EyeIcon,
   FilePenIcon,
@@ -23,6 +24,7 @@ import {
   XIcon,
 } from "lucide-react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   AlertDialog,
   AlertDialogCancel,
@@ -82,13 +84,19 @@ import { textOf } from "./text";
 import ActivityPanel, { MAX_WIDTH, MIN_WIDTH } from "./ActivityPanel";
 import { makeEvent, mergeEvents, upsertEvent, type ActivityDraft, type ActivityEvent } from "./activity";
 import { flushActivity, loadChatActivity, saveActivity } from "./auditLog";
+import ChangesDialog from "./ChangesDialog";
 import ChatList from "./ChatList";
+import {
+  changedByTurn, checkpointStatus, describePlan, filesFrom, previewRevert, revertRuns, runsFrom, summarizeRevert,
+  type CheckpointRun, type PlanSummary,
+} from "./checkpoints";
 import CostChip, { budgetStep } from "./CostChip";
 import ContextMeter from "./ContextMeter";
 import { contextBreakdown } from "./context";
 import { addUsage, budgetState, effectiveCap, emptyUsage, formatCost, type ChatUsage } from "./cost";
 import ExportMenu from "./ExportMenu";
 import { chatToJson, chatToMarkdown, exportFileName } from "./exportChat";
+import { branchName, describeGit, gitCreateBranch, gitStatus, isChatBranch, isShowable, type GitInfo } from "./git";
 import { autoTitle, forkMessages, repairMessages, repairSubagents, runState, type RunState } from "./history";
 import { formatInstructions, type ProjectInstructions } from "./instructions";
 import DiffView from "./DiffView";
@@ -181,6 +189,7 @@ function buildConversation(p: {
   subagents: Record<string, SubagentRun>;
   usage: ChatUsage;
   stopped: boolean;
+  checkpoints: CheckpointRun[];
 }): Conversation {
   return {
     id: p.id,
@@ -195,6 +204,7 @@ function buildConversation(p: {
     usage: p.usage,
     budgetExtra: p.meta.budgetExtra,
     forkedFrom: p.meta.forkedFrom,
+    checkpoints: p.checkpoints,
   };
 }
 
@@ -227,6 +237,18 @@ export default function App() {
   const [fullOutput, setFullOutput] = useState(false); // exports: keep whole tool results
   const [notice, setNotice] = useState("");
   const [permissionsOpen, setPermissionsOpen] = useState(false);
+  // Runs that may have changed files (Rust keeps undo copies of them), and how many files each turn changed.
+  const [checkpointRuns, setCheckpointRuns] = useState<CheckpointRun[]>([]);
+  const checkpointRunsRef = useRef<CheckpointRun[]>([]);
+  const [changed, setChanged] = useState<Record<string, number>>({});
+  const [revertPlan, setRevertPlan] = useState<{ runIds: string[]; summary: PlanSummary } | null>(null);
+  const [regenChoice, setRegenChoice] = useState<number | null>(null); // index of the message being answered again
+  const [undoDiscarded, setUndoDiscarded] = useState(true); // the checkbox on the regenerate and edit dialogs
+  const [limitsReady, setLimitsReady] = useState(false);
+  const [gitInfo, setGitInfo] = useState<Record<string, GitInfo>>({}); // by project name
+  const [changesFor, setChangesFor] = useState<string | null>(null); // the project whose Changes dialog is open
+  const [branchPerChat, setBranchPerChat] = useState(false); // put each chat's changes on their own git branch
+  const branchedRef = useRef(new Set<string>()); // "chat:project" pairs already handled this session
   const [events, setEvents] = useState<ActivityEvent[]>([]); // the activity log for the chat on screen
   const eventsRef = useRef<ActivityEvent[]>([]);
   const [activityOpen, setActivityOpen] = useState(false);
@@ -304,11 +326,32 @@ export default function App() {
     getSetting("model", DEFAULT_MODEL).then(setModel);
     getSetting<Mode>("mode", "ask").then(changeMode);
     getSetting("polish", true).then(setPolishOn);
-    getSetting<Partial<Limits>>("limits", {}).then((l) => setLimits(resolveLimits(l)));
+    getSetting<Partial<Limits>>("limits", {}).then((l) => {
+      setLimits(resolveLimits(l));
+      setLimitsReady(true);
+    });
     getSetting("redact", true).then(setRedactOn);
+    getSetting("gitBranchPerChat", false).then(setBranchPerChat);
     getSetting("activityOpen", false).then(setActivityOpen);
     getSetting("activityWidth", 420).then((w) => setActivityWidth(Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, w))));
   }, []);
+
+  // Show each open project's branch. Looked at again when projects change, when a run ends, and when you come back to the window.
+  const projectKey = projects.map((p) => p.name).join("\n");
+  useEffect(() => {
+    void refreshGit();
+    const onFocus = () => void refreshGit();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspace, projectKey]);
+
+  // Clear out old undo copies once the limits are known.
+  useEffect(() => {
+    if (!workspace || !limitsReady) return;
+    invoke("checkpoint_prune", { maxAgeDays: limits.checkpointDays, maxMegabytes: limits.checkpointMb }).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspace, limitsReady]);
 
   // Write any activity still waiting to be saved when the window closes (best effort).
   useEffect(() => {
@@ -426,8 +469,64 @@ export default function App() {
     setUsageBoth(emptyUsage());
     setLastUsage(null);
     setEditing(null);
+    setRuns([]);
+    setChanged({});
     updateQueue(() => []);
     setError("");
+  }
+
+  function setRuns(runs: CheckpointRun[]) {
+    checkpointRunsRef.current = runs;
+    setCheckpointRuns(runs);
+  }
+
+  /** Looks at each open project's git state for the badges in the header. */
+  async function refreshGit(names = projects.map((p) => p.name)) {
+    if (!workspace) return;
+    const entries = await Promise.all(
+      names.map(async (name) => [name, await gitStatus(workspace, name).catch(() => undefined)] as const),
+    );
+    setGitInfo((old) => {
+      const next = { ...old };
+      for (const [name, info] of entries) {
+        if (info) next[name] = info;
+        else delete next[name];
+      }
+      return next;
+    });
+  }
+
+  /** Before the agent's first change to a project in this chat, put the chat on its own branch (if that's switched on). */
+  async function prepareBranch(project: string, forChat: string, title: string) {
+    if (!branchPerChat || !workspace) return;
+    const key = `${forChat}:${project}`;
+    if (branchedRef.current.has(key)) return;
+    branchedRef.current.add(key);
+    const info = await gitStatus(workspace, project);
+    if (!isShowable(info) || info.blocked || isChatBranch(info.branch)) return;
+    const name = branchName(title, forChat);
+    try {
+      await gitCreateBranch(workspace, project, name);
+      emitEvent({ category: "chat", summary: `Put ${project} on a new branch, ${name}, before the first change` }, forChat);
+      setNotice(`${project} is now on the branch ${name}.`);
+      void refreshGit([project]);
+    } catch (e) {
+      emitEvent({ category: "chat", level: "warn", summary: `Didn't make a branch for ${project}: ${String(e)}` }, forChat);
+      setNotice(`Didn't make a branch for ${project}: ${String(e)}`);
+    }
+  }
+
+  /** Asks Rust how many files each turn changed, and forgets runs that changed none. */
+  async function refreshChanged(forChat: string, runs: CheckpointRun[]) {
+    try {
+      const status = await checkpointStatus(forChat, runs);
+      if (chatIdRef.current !== forChat) return;
+      setChanged(changedByTurn(runs, status));
+      const live = runs.filter((r) => (status.find((s) => s.runId === r.run)?.files ?? 0) > 0);
+      if (live.length !== runs.length && checkpointRunsRef.current === runs) setRuns(live);
+    } catch {
+      // no undo information available: the buttons just don't show
+    }
   }
 
   /** Puts a chat on screen. */
@@ -446,6 +545,9 @@ export default function App() {
     setUsageBoth(c.usage ?? emptyUsage());
     setLastUsage(null);
     setEditing(null);
+    setRuns(c.checkpoints ?? []);
+    setChanged({});
+    void refreshChanged(c.id, c.checkpoints ?? []);
     updateQueue(() => []);
     setError("");
   }
@@ -464,6 +566,7 @@ export default function App() {
   async function removeChat(id: string) {
     if (!workspace) return;
     await deleteConversation(workspace, id);
+    invoke("checkpoint_delete_chat", { chatId: id }).catch(() => {});
     setChats(await listChats(workspace));
     if (id === chatId) newChat();
   }
@@ -587,19 +690,51 @@ export default function App() {
     if (messages.length > 0) await updateChatMeta(workspace, chatId, { budgetExtra }).catch(() => {});
   }
 
+  /** Shows what undoing a turn's file changes would do, and waits for you to confirm. */
+  async function startRevert(turn: number) {
+    if (busy) return;
+    const runIds = runsFrom(checkpointRunsRef.current, turn, true);
+    try {
+      setRevertPlan({ runIds, summary: describePlan(await previewRevert(chatIdRef.current, runIds)) });
+    } catch (e) {
+      setError(`Undo: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  /** Reverts runs and reports what happened. Files you changed since are left alone unless `force`. */
+  async function undoRuns(runIds: string[], force: boolean) {
+    const forChat = chatIdRef.current;
+    try {
+      const result = await revertRuns(forChat, runIds, force);
+      const text = summarizeRevert(result);
+      setNotice(text);
+      emitEvent({ category: "chat", level: result.skipped.length ? "warn" : "info", summary: text }, forChat);
+    } catch (e) {
+      setError(`Undo: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    await refreshChanged(forChat, checkpointRunsRef.current);
+    void refreshGit();
+  }
+
+  async function confirmRevert(force: boolean) {
+    const plan = revertPlan;
+    setRevertPlan(null);
+    if (plan) await undoRuns(plan.runIds, force);
+  }
+
   /** Throws away the last reply and asks again. */
   async function regenerate() {
     if (busy) return;
     const at = messages.map((m) => m.role).lastIndexOf("user");
     if (at === -1) return;
-    const dropped = messages.slice(at + 1);
-    if (actedIn(dropped)) {
-      const go = await confirm(
-        "Regenerating starts this reply over, but it won't undo changes already made to files or commands already run.",
-        { title: "Regenerate?", kind: "warning", okLabel: "Regenerate" },
-      );
-      if (!go) return;
-    }
+    // If the reply changed files or ran commands, say so first (and offer to undo the files).
+    if (actedIn(messages.slice(at + 1))) setRegenChoice(at);
+    else regenerateFrom(at, false);
+  }
+
+  async function regenerateFrom(at: number, undo: boolean) {
+    setRegenChoice(null);
+    if (undo) await undoRuns(runsFrom(checkpointRunsRef.current, at), false);
     const kept = messages.slice(0, at + 1);
     run(kept, { subagents: subagentsFor(kept) });
   }
@@ -661,17 +796,18 @@ export default function App() {
     });
   }
 
-  function editInPlace() {
+  async function editInPlace() {
     const choice = editChoice;
     setEditChoice(null);
     if (!choice || busy) return;
+    if (undoDiscarded && filesFrom(changed, choice.index) > 0) await undoRuns(runsFrom(checkpointRunsRef.current, choice.index), false);
     const kept = messages.slice(0, choice.index);
     run([...kept, { role: "user", content: choice.text }], { subagents: subagentsFor(kept) });
   }
 
   async function exportChat(format: "md" | "json") {
     if (messages.length === 0) return;
-    const convo = buildConversation({ id: chatId, meta: chatMeta, messages, projects, subagents, usage, stopped });
+    const convo = buildConversation({ id: chatId, meta: chatMeta, messages, projects, subagents, usage, stopped, checkpoints: checkpointRuns });
     const options = { fullToolOutput: fullOutput };
     const text = format === "md" ? chatToMarkdown(convo, options) : chatToJson(convo, options);
     try {
@@ -706,7 +842,9 @@ export default function App() {
     let subs = { ...(opts.subagents ?? subagents) };
     const id = opts.id ?? chatId;
     const meta = opts.meta ?? chatMeta;
-    const turn = history.map((m) => m.role).lastIndexOf("user"); // costs are totalled per turn
+    const turn = history.map((m) => m.role).lastIndexOf("user"); // costs and undo are kept per turn
+    const runId = newId();
+    setRuns([...checkpointRunsRef.current, { run: runId, turn }]);
     const chatCap = effectiveCap(limits.budgetUsd, meta.budgetExtra);
     const emit = (draft: ActivityDraft) => emitEvent(draft, id);
     const runRef = `run-${id}-${Date.now()}`;
@@ -720,7 +858,7 @@ export default function App() {
     });
 
     const snapshot = (wasStopped = false) =>
-      buildConversation({ id, meta, messages: latest, projects: latestProjects, subagents: subs, usage: usageRef.current, stopped: wasStopped });
+      buildConversation({ id, meta, messages: latest, projects: latestProjects, subagents: subs, usage: usageRef.current, stopped: wasStopped, checkpoints: checkpointRunsRef.current });
     // Save at most every couple of seconds while the agent works (not on every streamed word).
     let timer: ReturnType<typeof setTimeout> | undefined;
     const saveSoon = () => {
@@ -753,6 +891,8 @@ export default function App() {
         getMode: () => modeRef.current,
         limits,
         redact: redactOn,
+        checkpoint: { chatId: id, runId },
+        beforeWrite: (project) => prepareBranch(project, id, meta.titleEdited && meta.title ? meta.title : autoTitle(latest)),
         messages: history,
         ask,
         signal: controller.signal,
@@ -827,6 +967,8 @@ export default function App() {
       try {
         await saveConversation(workspace, snapshot(wasStopped));
         setChats(await listChats(workspace));
+        await refreshChanged(id, checkpointRunsRef.current);
+        void refreshGit(latestProjects.map((p) => p.name));
       } catch (e) {
         setError(`Couldn't save this chat: ${e instanceof Error ? e.message : String(e)}`);
         emit({ category: "error", level: "error", summary: `Couldn't save this chat: ${e instanceof Error ? e.message : String(e)}` });
@@ -994,6 +1136,21 @@ export default function App() {
                     {p.name}
                     {instructions.some((i) => i.project === p.name) && <FileTextIcon aria-label="Has CLAUDE.md" />}
                   </Button>
+                  {isShowable(gitInfo[p.name]) && (
+                    <Button
+                      size="xs"
+                      variant="outline"
+                      onClick={() => setChangesFor(p.name)}
+                      title={gitInfo[p.name].blocked ?? `${describeGit(gitInfo[p.name])}. Click to see the changes.`}
+                      className={isChatBranch(gitInfo[p.name].branch) ? "text-blue-600 dark:text-blue-400" : ""}
+                    >
+                      <GitBranchIcon />
+                      <span className="max-w-32 truncate">{gitInfo[p.name].branch ?? "no commits"}</span>
+                      {gitInfo[p.name].changed + gitInfo[p.name].untracked > 0 && (
+                        <span className="text-amber-600 dark:text-amber-400">●{gitInfo[p.name].changed + gitInfo[p.name].untracked}</span>
+                      )}
+                    </Button>
+                  )}
                   <Button
                     size="icon-xs"
                     variant="outline"
@@ -1037,6 +1194,11 @@ export default function App() {
                 onExport={exportChat}
               />
               <LimitsPopover
+                branchPerChat={branchPerChat}
+                onBranchPerChatChange={(on) => {
+                  setBranchPerChat(on);
+                  setSetting("gitBranchPerChat", on);
+                }}
                 redact={redactOn}
                 onRedactChange={(on) => {
                   setRedactOn(on);
@@ -1068,6 +1230,8 @@ export default function App() {
                 streaming={streaming}
                 subagents={subagents}
                 turnCosts={usage.turns}
+                changedTurns={changed}
+                onRevert={startRevert}
                 busy={busy}
                 onFork={forkChat}
                 onEdit={(index) => setEditing({ index, text: textOf(messages[index]?.content) })}
@@ -1374,6 +1538,87 @@ export default function App() {
         )}
       </SidebarProvider>
 
+      <AlertDialog open={regenChoice !== null} onOpenChange={(open) => !open && setRegenChoice(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Regenerate this reply?</AlertDialogTitle>
+            <AlertDialogDescription>
+              The reply changed files or ran commands. Regenerating starts it over. It can't take back commands that already ran.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          {regenChoice !== null && filesFrom(changed, regenChoice) > 0 && (
+            <div className="flex items-center gap-2">
+              <Checkbox id="undo-regen" checked={undoDiscarded} onCheckedChange={(v) => setUndoDiscarded(v === true)} />
+              <Label htmlFor="undo-regen">
+                Also undo the {filesFrom(changed, regenChoice)} file {filesFrom(changed, regenChoice) === 1 ? "change" : "changes"} it made
+              </Label>
+            </div>
+          )}
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <Button onClick={() => regenChoice !== null && regenerateFrom(regenChoice, undoDiscarded && filesFrom(changed, regenChoice) > 0)}>
+              Regenerate
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={revertPlan !== null} onOpenChange={(open) => !open && setRevertPlan(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Undo this reply's file changes?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {revertPlan && revertPlan.summary.lines.length === 0
+                ? "Every file is already as it was before the reply."
+                : "Files are put back to how they were before the agent changed them. Commands the agent ran (installs, deleted files, git) are not undone."}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          {revertPlan && revertPlan.summary.lines.length > 0 && (
+            <ul className="max-h-60 overflow-y-auto rounded-md border p-2 text-xs">
+              {revertPlan.summary.lines.map((line) => (
+                <li key={line.text} className={line.conflict ? "text-amber-700 dark:text-amber-400" : ""}>
+                  {line.text}
+                </li>
+              ))}
+            </ul>
+          )}
+          {revertPlan && revertPlan.summary.conflicts > 0 && (
+            <p className="text-sm text-muted-foreground">
+              {revertPlan.summary.conflicts === 1 ? "One file was" : `${revertPlan.summary.conflicts} files were`} changed since the agent wrote
+              {revertPlan.summary.conflicts === 1 ? " it" : " them"}. "Undo the rest" leaves {revertPlan.summary.conflicts === 1 ? "it" : "them"} alone; "Overwrite everything" puts back
+              the agent's starting version and loses your changes.
+            </p>
+          )}
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            {revertPlan && revertPlan.summary.conflicts > 0 && (
+              <Button variant="destructive" onClick={() => confirmRevert(true)}>
+                Overwrite everything
+              </Button>
+            )}
+            <Button onClick={() => confirmRevert(false)}>{revertPlan && revertPlan.summary.conflicts > 0 ? "Undo the rest" : "Undo"}</Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {changesFor && apiKey && workspace && (
+        <ChangesDialog
+          open
+          onOpenChange={(open) => !open && setChangesFor(null)}
+          workspace={workspace}
+          project={changesFor}
+          info={gitInfo[changesFor]}
+          apiKey={apiKey}
+          model={model}
+          busy={busy}
+          onCommitted={(summary) => {
+            setNotice(`Committed ${changesFor}: ${summary}`);
+            emitEvent({ category: "chat", summary: `You committed in ${changesFor}: ${summary}` }, chatIdRef.current);
+            void refreshGit([changesFor]);
+          }}
+        />
+      )}
+
       <PermissionsDialog open={permissionsOpen} onOpenChange={setPermissionsOpen} workspace={workspace} />
 
       <AlertDialog open={editChoice !== null} onOpenChange={(open) => !open && setEditChoice(null)}>
@@ -1384,9 +1629,17 @@ export default function App() {
               Editing a message restarts the conversation from that point. Branch off to keep this chat as it is, or replace
               everything after the message in this chat.
               {editChoice && actedIn(messages.slice(editChoice.index + 1)) &&
-                " Replacing won't undo changes the agent already made to files or commands it already ran."}
+                " Neither choice undoes commands the agent already ran, and a new chat starts with the files as they are now."}
             </AlertDialogDescription>
           </AlertDialogHeader>
+          {editChoice && filesFrom(changed, editChoice.index) > 0 && (
+            <div className="flex items-center gap-2">
+              <Checkbox id="undo-edit" checked={undoDiscarded} onCheckedChange={(v) => setUndoDiscarded(v === true)} />
+              <Label htmlFor="undo-edit">
+                When replacing, also undo the {filesFrom(changed, editChoice.index)} file {filesFrom(changed, editChoice.index) === 1 ? "change" : "changes"} made after this message
+              </Label>
+            </div>
+          )}
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <Button variant="outline" onClick={editInPlace}>

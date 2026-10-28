@@ -7,6 +7,8 @@ export type Limits = {
   outputTailChars: number; // ...and of the end
   maxResultChars: number; // the most any one tool result may send to the model
   budgetUsd: number; // the most one chat may spend, in dollars; 0 means no limit
+  checkpointDays: number; // how long undo copies of the agent's file changes are kept
+  checkpointMb: number; // ...and how much room they may take
 };
 
 export const DEFAULT_LIMITS: Limits = {
@@ -16,6 +18,8 @@ export const DEFAULT_LIMITS: Limits = {
   outputTailChars: 20_000,
   maxResultChars: 100_000,
   budgetUsd: 0,
+  checkpointDays: 30,
+  checkpointMb: 500,
 };
 
 // [min, max] for each. The Rust side enforces the same ceilings.
@@ -26,6 +30,8 @@ export const LIMIT_BOUNDS: Record<keyof Limits, [number, number]> = {
   outputTailChars: [0, 200_000],
   maxResultChars: [5_000, 400_000],
   budgetUsd: [0, 1000],
+  checkpointDays: [1, 365],
+  checkpointMb: [50, 20_000],
 };
 
 /** Fills in anything missing, clamps every value to its bounds, and keeps the default timeout under the maximum. */

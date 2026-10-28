@@ -14,6 +14,8 @@ const FIELDS: { key: keyof Limits; label: string; unit: string }[] = [
   { key: "outputTailChars", label: "Command output: keep the end", unit: "characters" },
   { key: "maxResultChars", label: "Largest tool result", unit: "characters" },
   { key: "budgetUsd", label: "Budget for each chat (0 = none)", unit: "dollars" },
+  { key: "checkpointDays", label: "Keep undo copies for", unit: "days" },
+  { key: "checkpointMb", label: "Undo copies may take up to", unit: "MB" },
 ];
 
 type Props = {
@@ -21,10 +23,12 @@ type Props = {
   onChange: (limits: Limits) => void;
   redact: boolean;
   onRedactChange: (on: boolean) => void;
+  branchPerChat: boolean;
+  onBranchPerChatChange: (on: boolean) => void;
 };
 
 /** Header menu for the limits in src/limits.ts. A value is applied (and clamped) when you leave its box. */
-export default function LimitsPopover({ limits, onChange, redact, onRedactChange }: Props) {
+export default function LimitsPopover({ limits, onChange, redact, onRedactChange, branchPerChat, onBranchPerChatChange }: Props) {
   const [draft, setDraft] = useState<Record<string, string>>({});
   useEffect(() => setDraft({}), [limits]);
 
@@ -77,6 +81,16 @@ export default function LimitsPopover({ limits, onChange, redact, onRedactChange
               <span className="text-xs text-muted-foreground">
                 Keys, tokens and passwords in files and command output are replaced with a placeholder before the model sees them.
                 It catches common formats, not everything.
+              </span>
+            </div>
+          </div>
+          <div className="flex items-start gap-3">
+            <Switch id="branch" checked={branchPerChat} onCheckedChange={onBranchPerChatChange} />
+            <div className="flex flex-col gap-0.5">
+              <Label htmlFor="branch">Give each chat its own git branch</Label>
+              <span className="text-xs text-muted-foreground">
+                Before the agent's first change to a git project, a branch like billybot/fix-login-1a2b is made. Skipped if the project has
+                uncommitted changes. Nothing is stashed, discarded or pushed.
               </span>
             </div>
           </div>

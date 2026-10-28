@@ -13,6 +13,7 @@ A small desktop agent harness built with Tauri, React and TypeScript. Pick a wor
 - **Chat history:** every chat is saved as it runs, one file each in the app's data folder, with search, rename, pin, and Continue / Regenerate buttons after a stop, a step limit or a crash.
 - **Cost and budget:** each chat shows what it has cost (subagents included) and can stop at a budget you set. Fork a chat from any message, edit and resend an earlier message, export a chat as Markdown or JSON with secrets redacted, and queue messages while the agent is working.
 - **Safety:** secrets in tool results are hidden from the model; commands that look dangerous (`sudo`, `rm -rf ~`, `git push --force`, `curl | sh`…) ask even in Bypass mode; **Plan** mode lets the agent explore read-only and propose a plan you approve (Shift+Tab cycles modes).
+- **Undo and git:** the app keeps a copy of every file before the agent changes it, and each reply that changed files gets an **Undo** button (files you edited since are left alone unless you say otherwise). Git projects show their branch and changes in the header, with a Changes dialog that can draft and make a commit, and an optional branch per chat. Nothing is ever pushed.
 - **Activity log:** a panel on the right (the pulse icon) shows every request, tool call, approval, subagent and error as it happens, and is saved to an audit log in the app's data folder (`audit/YYYY-MM.jsonl`).
 - **Project instructions:** each open project's `CLAUDE.md` is loaded into the agent's instructions.
 - **Context meter** with a per-category usage breakdown.
@@ -65,7 +66,7 @@ Change the model by editing `MODEL_FILE` in `src-tauri/src/stt.rs`.
 
 ## Security notes
 
-This app lets a language model read and write files and run shell commands on your machine. The dangerous-command check and secret hiding are guardrails for common cases, not security boundaries: a command can be written in ways no check will catch, and a secret in an unusual format will get through. Review permission prompts before approving them, and only open projects you are comfortable giving the model access to. The app's webview runs with a restrictive Content Security Policy that only allows network access to `openrouter.ai`.
+This app lets a language model read and write files and run shell commands on your machine. The dangerous-command check and secret hiding are guardrails for common cases, not security boundaries: a command can be written in ways no check will catch, and a secret in an unusual format will get through. Undo covers the agent's file edits, not what a command did. Review permission prompts before approving them, and only open projects you are comfortable giving the model access to. The app's webview runs with a restrictive Content Security Policy that only allows network access to `openrouter.ai`.
 
 ## Project layout
 

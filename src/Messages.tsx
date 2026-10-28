@@ -9,6 +9,7 @@ import {
   FolderTreeIcon,
   FolderXIcon,
   GitForkIcon,
+  Undo2Icon,
   ListIcon,
   PencilIcon,
   SearchIcon,
@@ -175,6 +176,8 @@ type Props = {
   streaming: string; // text of the reply as it streams in
   subagents?: Record<string, SubagentRun>;
   turnCosts?: Record<string, number>; // dollars per turn, keyed by the index of the turn's user message
+  changedTurns?: Record<string, number>; // files each turn changed, which can be undone
+  onRevert?: (turn: number) => void;
   busy?: boolean; // hides the per-message actions while the agent works
   onFork?: (index: number) => void;
   onEdit?: (index: number) => void;
@@ -194,6 +197,8 @@ export default function MessageList({
   streaming,
   subagents = {},
   turnCosts = {},
+  changedTurns = {},
+  onRevert,
   busy = false,
   onFork,
   onEdit,
@@ -270,6 +275,8 @@ export default function MessageList({
               const next = messages[i + 1];
               const endsTurn = !next || next.role === "user"; // the last thing the agent said before you spoke again
               const cost = turnCosts[String(turn)];
+              const thisTurn = turn; // `turn` moves on as the loop continues; a click happens later
+              const changedFiles = changedTurns[String(thisTurn)] ?? 0;
               return (
                 <MessageScrollerItem key={i} messageId={String(i)}>
                   <Message>
@@ -286,9 +293,20 @@ export default function MessageList({
                           )}
                         </Trace>
                       )}
-                      {endsTurn && !busy && (cost !== undefined || onFork) && (
+                      {endsTurn && !busy && (cost !== undefined || onFork || changedFiles > 0) && (
                         <div className="flex items-center gap-2 text-xs text-muted-foreground">
                           {cost !== undefined && <span title="What this turn cost">{formatCost(cost)}</span>}
+                          {changedFiles > 0 && onRevert && (
+                            <Button
+                              size="xs"
+                              variant="ghost"
+                              className="text-foreground"
+                              onClick={() => onRevert(thisTurn)}
+                              title="Put the files this reply changed back as they were"
+                            >
+                              <Undo2Icon /> Undo {changedFiles} {changedFiles === 1 ? "file" : "files"}
+                            </Button>
+                          )}
                           {onFork && (
                             <div className={actionsClass}>
                               <Button size="xs" variant="ghost" onClick={() => onFork(i)}>

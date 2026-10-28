@@ -80,7 +80,7 @@ export const fileTools: Tool[] = [
     // For a full rewrite, fetch the current text so the approval card can show what changes.
     preview: (_args, t, o) => invoke<string>("read_file", { workspace: o.workspace, ...pp(need(t)) }).catch(() => null),
     run: (args, t, { o }) =>
-      invoke<string>("write_file", { workspace: o.workspace, ...pp(need(t)), content: String(args.content ?? "") }),
+      invoke<string>("write_file", { workspace: o.workspace, ...pp(need(t)), content: String(args.content ?? ""), checkpoint: o.checkpoint }),
   },
   {
     name: "edit_file",
@@ -107,6 +107,7 @@ export const fileTools: Tool[] = [
         ...pp(need(t)),
         oldText: String(args.old_text ?? ""),
         newText: String(args.new_text ?? ""),
+        checkpoint: o.checkpoint,
       }),
   },
   {
@@ -141,6 +142,6 @@ export const fileTools: Tool[] = [
     },
     preview: (_args, t, o) => invoke<string>("read_file", { workspace: o.workspace, ...pp(need(t)) }).catch(() => null),
     run: (args, t, { o }) =>
-      invoke<string>("multi_edit", { workspace: o.workspace, ...pp(need(t)), edits: parseEdits(args.edits) }),
+      invoke<string>("multi_edit", { workspace: o.workspace, ...pp(need(t)), edits: parseEdits(args.edits), checkpoint: o.checkpoint }),
   },
 ];

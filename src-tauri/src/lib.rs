@@ -1,5 +1,7 @@
 mod audit;
+mod checkpoint;
 mod chats;
+mod git;
 mod procgroup;
 mod search;
 mod stt;
@@ -12,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use checkpoint::{CheckpointArg, Ckpt};
 use procgroup::ProcessGroup;
 
 // Where the API key lives in the system credential store: macOS Keychain, Windows Credential
@@ -72,7 +75,7 @@ fn set_api_key(key: String) -> Result<(), String> {
 /// right for comparing paths, but cmd.exe, node and git mishandle it as a working directory,
 /// and it is ugly in the UI. This gives the ordinary spelling when that is equivalent, and
 /// leaves anything else (including paths too long for the ordinary form) alone.
-fn strip_verbatim(path: &str) -> String {
+pub(crate) fn strip_verbatim(path: &str) -> String {
     const MAX_PLAIN: usize = 259; // MAX_PATH minus the terminator
     if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
         let plain = format!(r"\\{unc}");
@@ -255,11 +258,59 @@ fn read_file(workspace: String, project: String, path: String) -> Result<String,
     fs::read_to_string(file).map_err(|e| e.to_string())
 }
 
+/// git keeps its own data in `.git`; changing it by hand can break the repository or make git
+/// run a program the next time anything calls it (hooks, fsmonitor). The file tools stay out.
+fn refuse_git_data(root: &Path, file: &Path) -> Result<(), String> {
+    let rel = file.strip_prefix(root).unwrap_or(file);
+    if rel.components().any(|c| c.as_os_str().eq_ignore_ascii_case(".git")) {
+        return Err("Refused: .git is git's own data. Use git commands to change a repository, not the file tools.".into());
+    }
+    Ok(())
+}
+
+/// Saves an undo copy (if this write belongs to a run), then runs `write`, then records what was left.
+fn with_undo(
+    ckpt: Option<&Ckpt>,
+    root: &Path,
+    file: &Path,
+    project: &str,
+    write: impl FnOnce() -> Result<String, String>,
+) -> Result<String, String> {
+    let rel = checkpoint::relative(root, file);
+    if let Some(c) = ckpt {
+        c.before(project, &rel, file)
+            .map_err(|e| format!("Couldn't keep an undo copy, so nothing was changed: {e}"))?;
+    }
+    let mut message = write()?;
+    if let Some(c) = ckpt {
+        if let Err(e) = c.after(project, &rel, file) {
+            message.push_str(&format!(" (Warning: couldn't record undo information: {e})"));
+        }
+    }
+    Ok(message)
+}
+
+fn do_write_file(workspace: &str, project: &str, path: &str, content: &str, ckpt: Option<&Ckpt>) -> Result<String, String> {
+    let root = project_root(workspace, project)?;
+    let file = resolve(&root, path)?;
+    refuse_git_data(&root, &file)?;
+    with_undo(ckpt, &root, &file, project, || {
+        fs::write(&file, content).map_err(|e| e.to_string())?;
+        Ok(format!("Wrote {} bytes to {project}/{path}", content.len()))
+    })
+}
+
 #[tauri::command]
-fn write_file(workspace: String, project: String, path: String, content: String) -> Result<String, String> {
-    let file = resolve(&project_root(&workspace, &project)?, &path)?;
-    fs::write(&file, &content).map_err(|e| e.to_string())?;
-    Ok(format!("Wrote {} bytes to {project}/{path}", content.len()))
+fn write_file(
+    app: tauri::AppHandle,
+    workspace: String,
+    project: String,
+    path: String,
+    content: String,
+    checkpoint: Option<CheckpointArg>,
+) -> Result<String, String> {
+    let ckpt = checkpoint::ckpt_from(&app, checkpoint, &workspace)?;
+    do_write_file(&workspace, &project, &path, &content, ckpt.as_ref())
 }
 
 // Limits for what read_lines hands the model in one go. The model asks for more with `offset`.
@@ -366,31 +417,48 @@ fn apply_edits(content: &str, edits: &[Edit]) -> Result<String, String> {
     Ok(text)
 }
 
+fn do_edit_file(
+    workspace: &str,
+    project: &str,
+    path: &str,
+    old_text: String,
+    new_text: String,
+    ckpt: Option<&Ckpt>,
+) -> Result<String, String> {
+    let root = project_root(workspace, project)?;
+    let file = resolve(&root, path)?;
+    refuse_git_data(&root, &file)?;
+    let content = fs::read_to_string(&file).map_err(|e| e.to_string())?;
+    let updated = apply_edits(&content, &[Edit { old_text, new_text }])?;
+    with_undo(ckpt, &root, &file, project, || {
+        fs::write(&file, updated).map_err(|e| e.to_string())?;
+        Ok(format!("Edited {project}/{path}"))
+    })
+}
+
 /// Replaces one exact snippet in a file.
 #[tauri::command]
 fn edit_file(
+    app: tauri::AppHandle,
     workspace: String,
     project: String,
     path: String,
     old_text: String,
     new_text: String,
+    checkpoint: Option<CheckpointArg>,
 ) -> Result<String, String> {
-    let file = resolve(&project_root(&workspace, &project)?, &path)?;
-    let content = fs::read_to_string(&file).map_err(|e| e.to_string())?;
-    let updated = apply_edits(&content, &[Edit { old_text, new_text }])?;
-    fs::write(&file, updated).map_err(|e| e.to_string())?;
-    Ok(format!("Edited {project}/{path}"))
+    let ckpt = checkpoint::ckpt_from(&app, checkpoint, &workspace)?;
+    do_edit_file(&workspace, &project, &path, old_text, new_text, ckpt.as_ref())
 }
 
 const MAX_EDITS: usize = 100;
 
-/// Several edits to one file, all or nothing: the file is written once, and only if every edit applied.
-#[tauri::command]
-fn multi_edit(
-    workspace: String,
-    project: String,
-    path: String,
+fn do_multi_edit(
+    workspace: &str,
+    project: &str,
+    path: &str,
     edits: Vec<Edit>,
+    ckpt: Option<&Ckpt>,
 ) -> Result<String, String> {
     if edits.is_empty() {
         return Err("edits must not be empty".into());
@@ -398,11 +466,30 @@ fn multi_edit(
     if edits.len() > MAX_EDITS {
         return Err(format!("At most {MAX_EDITS} edits at a time. Split them up."));
     }
-    let file = resolve(&project_root(&workspace, &project)?, &path)?;
+    let root = project_root(workspace, project)?;
+    let file = resolve(&root, path)?;
+    refuse_git_data(&root, &file)?;
     let content = fs::read_to_string(&file).map_err(|e| e.to_string())?;
     let updated = apply_edits(&content, &edits).map_err(|e| format!("{e} No edits were applied."))?;
-    fs::write(&file, updated).map_err(|e| e.to_string())?;
-    Ok(format!("Made {} edits to {project}/{path}", edits.len()))
+    let count = edits.len();
+    with_undo(ckpt, &root, &file, project, || {
+        fs::write(&file, updated).map_err(|e| e.to_string())?;
+        Ok(format!("Made {count} edits to {project}/{path}"))
+    })
+}
+
+/// Several edits to one file, all or nothing: the file is written once, and only if every edit applied.
+#[tauri::command]
+fn multi_edit(
+    app: tauri::AppHandle,
+    workspace: String,
+    project: String,
+    path: String,
+    edits: Vec<Edit>,
+    checkpoint: Option<CheckpointArg>,
+) -> Result<String, String> {
+    let ckpt = checkpoint::ckpt_from(&app, checkpoint, &workspace)?;
+    do_multi_edit(&workspace, &project, &path, edits, ckpt.as_ref())
 }
 
 // ---------- Running commands ----------
@@ -689,6 +776,15 @@ pub fn run() {
             read_lines,
             edit_file,
             multi_edit,
+            checkpoint::checkpoint_status,
+            checkpoint::checkpoint_preview,
+            checkpoint::checkpoint_revert,
+            checkpoint::checkpoint_delete_chat,
+            checkpoint::checkpoint_prune,
+            git::git_status,
+            git::git_changes,
+            git::git_create_branch,
+            git::git_commit,
             chats::chat_write,
             chats::chat_read,
             chats::chat_delete,
@@ -719,7 +815,7 @@ mod tests {
     }
 
     fn edit(ws: &str, path: &str, old: &str, new: &str) -> Result<String, String> {
-        edit_file(ws.into(), "proj".into(), path.into(), old.into(), new.into())
+        do_edit_file(ws, "proj", path, old.into(), new.into(), None)
     }
 
     #[test]
@@ -775,15 +871,15 @@ mod tests {
         // Joining an absolute path replaces the project root, so this must be caught afterwards.
         let target = outside.to_string_lossy().to_string();
         assert!(edit(&ws, &target, "secret", "hacked").unwrap_err().contains("outside the project"));
-        assert!(write_file(ws.clone(), "proj".into(), target, "x".into()).is_err());
+        assert!(do_write_file(&ws, "proj", &target, "x", None).is_err());
         assert_eq!(fs::read_to_string(&outside).unwrap(), "secret");
     }
 
     #[test]
     fn a_new_file_cannot_be_created_outside_the_project() {
         let ws = workspace("new-outside");
-        assert!(write_file(ws.clone(), "proj".into(), "../new.txt".into(), "x".into()).is_err());
-        assert!(write_file(ws.clone(), "proj".into(), "sub/../../new.txt".into(), "x".into()).is_err());
+        assert!(do_write_file(&ws, "proj", "../new.txt", "x", None).is_err());
+        assert!(do_write_file(&ws, "proj", "sub/../../new.txt", "x", None).is_err());
         assert!(!Path::new(&format!("{ws}/new.txt")).exists());
     }
 
@@ -832,7 +928,7 @@ mod tests {
         let ws = workspace("dangling");
         let target = format!("{ws}/created-by-link.txt");
         std::os::unix::fs::symlink(&target, format!("{ws}/proj/link.txt")).unwrap();
-        let result = write_file(ws.clone(), "proj".into(), "link.txt".into(), "x".into());
+        let result = do_write_file(&ws, "proj", "link.txt", "x", None);
         assert!(result.is_err(), "{result:?}");
         assert!(!Path::new(&target).exists(), "the file was created through the link");
     }
@@ -1036,7 +1132,7 @@ mod tests {
         fs::write(format!("{ws}/other/secret.txt"), "top secret").unwrap();
         junction(&format!("{ws}/proj/out"), &format!("{ws}/other"));
         assert!(read_file(ws.clone(), "proj".into(), "out/secret.txt".into()).is_err());
-        assert!(write_file(ws.clone(), "proj".into(), "out/new.txt".into(), "x".into()).is_err());
+        assert!(do_write_file(&ws, "proj", "out/new.txt", "x", None).is_err());
         assert!(!Path::new(&format!("{ws}/other/new.txt")).exists());
     }
 
@@ -1141,7 +1237,7 @@ mod tests {
 
     fn multi(ws: &str, path: &str, edits: &[(&str, &str)]) -> Result<String, String> {
         let edits = edits.iter().map(|(o, n)| Edit { old_text: o.to_string(), new_text: n.to_string() }).collect();
-        multi_edit(ws.into(), "proj".into(), path.into(), edits)
+        do_multi_edit(ws, "proj", path, edits, None)
     }
 
     #[test]

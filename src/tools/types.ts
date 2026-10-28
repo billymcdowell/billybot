@@ -27,6 +27,10 @@ export type AgentOptions = {
   signal?: AbortSignal;
   // Everything the agent does, for the activity log. Subagents inherit it and mark theirs with a depth.
   onEvent?: (event: ActivityDraft) => void;
+  // Which chat and run a file change belongs to, so Rust can keep an undo copy of what it replaces.
+  checkpoint?: { chatId: string; runId: string };
+  // Called before a file change in a project goes ahead (after any approval). The app uses it to put a chat on its own git branch. A failure never blocks the change.
+  beforeWrite?: (project: string) => Promise<void>;
   redact?: boolean; // hide secrets from the model (default true)
   limits?: Partial<Limits>; // see src/limits.ts; missing values use the defaults
   role?: AgentRole;
