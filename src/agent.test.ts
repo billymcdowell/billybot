@@ -347,3 +347,51 @@ describe("limits", () => {
     expect(toolResults(out)[0].length).toBeLessThan(5_300);
   });
 });
+
+describe("Stop", () => {
+  /** A model that streams some text and is then cut off by Stop. */
+  function stoppedMidReply(controller: AbortController, partial: string, calls: object[] = []) {
+    client = {
+      requests: [],
+      create: vi.fn(async () =>
+        (async function* () {
+          yield { choices: [{ delta: { content: partial } }] };
+          for (const tc of calls) yield { choices: [{ delta: { tool_calls: [tc] } }] };
+          controller.abort();
+          throw new DOMException("Aborted", "AbortError");
+        })(),
+      ),
+    } as never;
+  }
+
+  it("keeps the text streamed so far and returns instead of throwing", async () => {
+    const controller = new AbortController();
+    stoppedMidReply(controller, "Let me look at");
+    const out = await runAgent(options({ signal: controller.signal }));
+    expect(last(out)).toEqual({ role: "assistant", content: "Let me look at" });
+    expect(out).toHaveLength(2);
+  });
+
+  it("drops a half-streamed tool call, so nothing dangling is left", async () => {
+    const controller = new AbortController();
+    stoppedMidReply(controller, "", [{ index: 0, id: "c1", function: { name: "write_file", arguments: '{"path":"app/a' } }]);
+    const out = await runAgent(options({ signal: controller.signal }));
+    expect(out).toEqual([{ role: "user", content: "hi" }]);
+  });
+
+  it("still throws real errors", async () => {
+    client = { requests: [], create: vi.fn(async () => { throw new Error("401 bad key"); }) } as never;
+    await expect(runAgent(options())).rejects.toThrow("401 bad key");
+  });
+
+  it("marks a subagent that was running when Stop was pressed as stopped", async () => {
+    backend({ check_project: () => undefined });
+    const controller = new AbortController();
+    const onSubagent = vi.fn();
+    await run([useTools(call("delegate_task", { project: "app", task: "t" })), say("ok")], { onSubagent, signal: controller.signal }, "bypass", () => {
+      controller.abort();
+      return say("partial report");
+    });
+    expect(last(onSubagent.mock.calls)[1]).toMatchObject({ status: "stopped" });
+  });
+});

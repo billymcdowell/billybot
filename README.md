@@ -10,6 +10,7 @@ A small desktop agent harness built with Tauri, React and TypeScript. Pick a wor
 - **Limits you can change:** command time limit and output size, and the largest tool result, from the sliders icon in the header.
 - **Workspace and subagents:** the agent can list, open, create and close projects inside one workspace folder and delegate tasks to subagents.
 - **Permissions and diffs:** file changes are shown as diffs and need your approval according to your settings.
+- **Chat history:** every chat is saved as it runs, one file each in the app's data folder, with search, rename, pin, and Continue / Regenerate buttons after a stop, a step limit or a crash.
 - **Project instructions:** each open project's `CLAUDE.md` is loaded into the agent's instructions.
 - **Context meter** with a per-category usage breakdown.
 - **Markdown replies** (links open externally, images are blocked).

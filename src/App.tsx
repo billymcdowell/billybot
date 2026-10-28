@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { confirm, open } from "@tauri-apps/plugin-dialog";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import {
   AlertCircleIcon,
@@ -13,11 +13,12 @@ import {
   FolderPlusIcon,
   MicIcon,
   PencilIcon,
+  PlayIcon,
   PlusIcon,
+  RefreshCwIcon,
   RotateCcwIcon,
   SquareIcon,
   TerminalIcon,
-  Trash2Icon,
   XIcon,
 } from "lucide-react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -55,13 +56,9 @@ import {
   Sidebar,
   SidebarContent,
   SidebarFooter,
-  SidebarGroup,
-  SidebarGroupContent,
-  SidebarGroupLabel,
   SidebarHeader,
   SidebarInset,
   SidebarMenu,
-  SidebarMenuAction,
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarProvider,
@@ -70,9 +67,11 @@ import {
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { DEFAULT_MODEL, loadInstructions, runAgent, systemPrompt, textOf, toolsFor } from "./agent";
+import { DEFAULT_MODEL, loadInstructions, runAgent, systemPrompt, toolsFor } from "./agent";
+import ChatList from "./ChatList";
 import ContextMeter from "./ContextMeter";
 import { contextBreakdown } from "./context";
+import { autoTitle, repairMessages, repairSubagents, runState, type RunState } from "./history";
 import { formatInstructions, type ProjectInstructions } from "./instructions";
 import DiffView from "./DiffView";
 import ModelPicker from "./ModelPicker";
@@ -89,9 +88,13 @@ import {
   clearAlwaysAllowed,
   deleteConversation,
   getSetting,
-  listConversations,
+  listChats,
+  loadChat,
   saveConversation,
+  searchChats,
   setSetting,
+  updateChatMeta,
+  type ChatSummary,
   type Conversation,
   type Mode,
   type OpenProject,
@@ -101,6 +104,16 @@ import {
 type Pending = { req: ApprovalRequest; resolve: (answer: Approval) => void };
 
 const newId = (): string => crypto.randomUUID();
+// Tools whose effects Regenerate can't take back.
+const ACTING_TOOLS = ["write_file", "edit_file", "multi_edit", "run_command", "create_project"];
+
+const STATE_NOTE: Record<RunState, string> = {
+  none: "",
+  done: "",
+  stopped: "Stopped.",
+  limit: "The agent used up its steps before finishing.",
+  unfinished: "This run didn't finish.",
+};
 const baseName = (p: string) => p.split(isWindows ? /[\\/]/ : "/").filter(Boolean).pop() ?? p;
 
 /** A centred card, used for the key and workspace screens. */
@@ -129,8 +142,11 @@ export default function App() {
   const [model, setModel] = useState(DEFAULT_MODEL);
   const [mode, setMode] = useState<Mode>("ask");
   const modeRef = useRef<Mode>("ask");
-  const [chats, setChats] = useState<Conversation[]>([]);
+  const [chats, setChats] = useState<ChatSummary[]>([]);
   const [chatId, setChatId] = useState(newId);
+  // What the open chat remembers besides its messages: a name the user chose, and whether it is pinned.
+  const [chatMeta, setChatMeta] = useState<{ title?: string; titleEdited?: boolean; pinned?: boolean }>({});
+  const [stopped, setStopped] = useState(false); // the last run ended because Stop was pressed
   const [messages, setMessages] = useState<ChatCompletionMessageParam[]>([]);
   const [projects, setProjects] = useState<OpenProject[]>([]);
   const [subagents, setSubagents] = useState<Record<string, SubagentRun>>({});
@@ -201,7 +217,7 @@ export default function App() {
 
   // Load this workspace's chats.
   useEffect(() => {
-    if (workspace) listConversations(workspace).then(setChats);
+    if (workspace) listChats(workspace).then(setChats);
   }, [workspace]);
 
   // Hold Command + Option together anywhere in the window to dictate; let go of either to stop.
@@ -258,6 +274,8 @@ export default function App() {
 
   function newChat() {
     setChatId(newId());
+    setChatMeta({});
+    setStopped(false);
     setMessages([]);
     setProjects([]);
     setSubagents({});
@@ -265,11 +283,21 @@ export default function App() {
     setError("");
   }
 
-  function openChat(c: Conversation) {
+  async function openChat(id: string) {
+    if (!workspace) return;
+    const c = await loadChat(workspace, id);
+    if (!c) {
+      setError("That chat couldn't be opened. It may have been deleted or damaged.");
+      setChats(await listChats(workspace));
+      return;
+    }
+    // A chat cut off by closing the app can have tool calls with no results, which the API refuses.
     setChatId(c.id);
-    setMessages(c.messages);
-    setProjects(c.projects ?? []);
-    setSubagents(c.subagents ?? {});
+    setChatMeta({ title: c.title, titleEdited: c.titleEdited, pinned: c.pinned });
+    setStopped(c.stopped === true);
+    setMessages(repairMessages(c.messages).messages);
+    setProjects(c.projects);
+    setSubagents(repairSubagents(c.subagents).subagents);
     setLastUsage(null);
     setError("");
   }
@@ -277,8 +305,22 @@ export default function App() {
   async function removeChat(id: string) {
     if (!workspace) return;
     await deleteConversation(workspace, id);
-    setChats(await listConversations(workspace));
+    setChats(await listChats(workspace));
     if (id === chatId) newChat();
+  }
+
+  async function renameChat(id: string, title: string) {
+    if (!workspace) return;
+    await updateChatMeta(workspace, id, { title });
+    if (id === chatId) setChatMeta((m) => ({ ...m, title: title.trim(), titleEdited: true }));
+    setChats(await listChats(workspace));
+  }
+
+  async function pinChat(id: string, pinned: boolean) {
+    if (!workspace) return;
+    await updateChatMeta(workspace, id, { pinned });
+    if (id === chatId) setChatMeta((m) => ({ ...m, pinned }));
+    setChats(await listChats(workspace));
   }
 
   // You can close a project or flip it between read-only and writable yourself.
@@ -312,20 +354,90 @@ export default function App() {
     setApprovals([]);
   }
 
-  async function send() {
+  /** Sends what you typed. */
+  function send() {
     const text = input.trim();
-    if (!text || !workspace || !apiKey || busy) return;
+    if (!text || busy) return;
     setInput("");
+    run([...messages, { role: "user", content: text }]);
+  }
+
+  /** Picks up where a stopped, cut-off or step-limited run left off. */
+  function continueRun() {
+    if (busy) return;
+    const last = messages[messages.length - 1];
+    // If the last thing is your own message, it never got an answer: ask again rather than add another.
+    run(last?.role === "user" ? messages : [...messages, { role: "user", content: "Continue." }]);
+  }
+
+  /** Throws away the last reply and asks again. */
+  async function regenerate() {
+    if (busy) return;
+    const at = messages.map((m) => m.role).lastIndexOf("user");
+    if (at === -1) return;
+    const dropped = messages.slice(at + 1);
+    const acted = dropped.some(
+      (m) =>
+        m.role === "assistant" &&
+        m.tool_calls?.some((c) => c.type === "function" && ACTING_TOOLS.includes(c.function.name)),
+    );
+    if (acted) {
+      const go = await confirm(
+        "Regenerating starts this reply over, but it won't undo changes already made to files or commands already run.",
+        { title: "Regenerate?", kind: "warning", okLabel: "Regenerate" },
+      );
+      if (!go) return;
+    }
+    const kept = messages.slice(0, at + 1);
+    const ids = new Set(kept.flatMap((m) => (m.role === "assistant" ? (m.tool_calls ?? []).map((c) => c.id) : [])));
+    const subs = Object.fromEntries(Object.entries(subagents).filter(([id]) => ids.has(id)));
+    setSubagents(subs);
+    run(kept, subs);
+  }
+
+  /** Runs the agent on `history` and saves the chat as it goes, so closing the app mid-run loses little. */
+  async function run(history: ChatCompletionMessageParam[], startSubagents = subagents) {
+    if (!workspace || !apiKey || busy) return;
     setError("");
     setBusy(true);
-
-    const history: ChatCompletionMessageParam[] = [...messages, { role: "user", content: text }];
+    setStopped(false);
     setMessages(history);
     const controller = new AbortController();
     abortRef.current = controller;
     let latest = history;
     let latestProjects = projects.map((p) => ({ ...p })); // the loop changes this copy
-    let subs = { ...subagents };
+    let subs = { ...startSubagents };
+    const id = chatId;
+    const meta = chatMeta;
+
+    const snapshot = (wasStopped = false): Conversation => ({
+      id,
+      title: meta.titleEdited && meta.title ? meta.title : autoTitle(latest),
+      titleEdited: meta.titleEdited,
+      pinned: meta.pinned,
+      updatedAt: Date.now(),
+      messages: latest,
+      projects: latestProjects,
+      subagents: subs,
+      stopped: wasStopped,
+    });
+    // Save at most every couple of seconds while the agent works (not on every streamed word).
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const saveSoon = () => {
+      if (timer) return;
+      timer = setTimeout(() => {
+        timer = undefined;
+        saveConversation(workspace, snapshot()).catch(() => {});
+      }, 2000);
+    };
+
+    // Your message is saved before the agent starts, so it survives a crash.
+    try {
+      await saveConversation(workspace, snapshot());
+      setChats(await listChats(workspace));
+    } catch (e) {
+      setError(`Couldn't save this chat: ${e instanceof Error ? e.message : String(e)}`);
+    }
 
     try {
       latest = await runAgent({
@@ -346,31 +458,31 @@ export default function App() {
           latest = msgs;
           setMessages([...msgs]);
           setStreaming(partial);
+          if (!partial) saveSoon();
         },
-        onSubagent: (id, run) => {
-          subs = { ...subs, [id]: run };
+        onSubagent: (callId, sub) => {
+          subs = { ...subs, [callId]: sub };
           setSubagents(subs);
+          saveSoon();
         },
         onUsage: setLastUsage,
       });
     } catch (e) {
       if (!controller.signal.aborted) setError(e instanceof Error ? e.message : String(e));
     } finally {
+      if (timer) clearTimeout(timer);
       setStreaming("");
       setBusy(false);
       setApprovals([]);
       setMessages(latest);
-      const first = latest.find((m) => m.role === "user");
-      const title = textOf(first?.content).slice(0, 40) || "New chat";
-      await saveConversation(workspace, {
-        id: chatId,
-        title,
-        updatedAt: Date.now(),
-        messages: latest,
-        projects: latestProjects,
-        subagents: subs,
-      });
-      setChats(await listConversations(workspace));
+      const wasStopped = controller.signal.aborted;
+      setStopped(wasStopped);
+      try {
+        await saveConversation(workspace, snapshot(wasStopped));
+        setChats(await listChats(workspace));
+      } catch (e) {
+        setError(`Couldn't save this chat: ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
   }
 
@@ -452,6 +564,7 @@ export default function App() {
   }
 
   const pending = approvals[0];
+  const state = runState(messages, stopped);
 
   return (
     <TooltipProvider>
@@ -474,33 +587,16 @@ export default function App() {
             </SidebarMenu>
           </SidebarHeader>
           <SidebarContent>
-            <SidebarGroup>
-              <SidebarGroupLabel>Chats</SidebarGroupLabel>
-              <SidebarGroupContent>
-                <SidebarMenu>
-                  {chats.map((c) => (
-                    <SidebarMenuItem key={c.id}>
-                      <SidebarMenuButton
-                        isActive={c.id === chatId}
-                        onClick={() => openChat(c)}
-                        disabled={busy}
-                        className="h-auto flex-col items-start gap-0"
-                      >
-                        <span className="w-full truncate">{c.title}</span>
-                        {c.projects?.length > 0 && (
-                          <span className="w-full truncate text-xs text-muted-foreground">
-                            {c.projects.map((p) => p.name).join(", ")}
-                          </span>
-                        )}
-                      </SidebarMenuButton>
-                      <SidebarMenuAction showOnHover onClick={() => removeChat(c.id)} disabled={busy}>
-                        <Trash2Icon />
-                      </SidebarMenuAction>
-                    </SidebarMenuItem>
-                  ))}
-                </SidebarMenu>
-              </SidebarGroupContent>
-            </SidebarGroup>
+            <ChatList
+              chats={chats}
+              activeId={chatId}
+              busy={busy}
+              onOpen={openChat}
+              onDelete={removeChat}
+              onRename={renameChat}
+              onPin={pinChat}
+              onSearch={(q) => searchChats(workspace, q)}
+            />
           </SidebarContent>
           <SidebarFooter>
             <SidebarMenu>
@@ -589,6 +685,26 @@ export default function App() {
           </div>
 
           <div className="mx-auto flex w-full max-w-3xl flex-col gap-3 p-4">
+            {!busy && state !== "none" && (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <span className="flex-1">
+                  {state === "unfinished" && messages[messages.length - 1]?.role === "user"
+                    ? "That message didn't get an answer."
+                    : STATE_NOTE[state]}
+                </span>
+                {state !== "done" && (
+                  <Button size="sm" variant="outline" onClick={continueRun}>
+                    <PlayIcon />
+                    {messages[messages.length - 1]?.role === "user" ? "Retry" : "Continue"}
+                  </Button>
+                )}
+                <Button size="sm" variant="ghost" onClick={regenerate} title="Throw away the last reply and ask again">
+                  <RefreshCwIcon />
+                  Regenerate
+                </Button>
+              </div>
+            )}
+
             {error && (
               <Alert variant="destructive">
                 <AlertCircleIcon />

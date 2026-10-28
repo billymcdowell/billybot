@@ -1,3 +1,4 @@
+mod chats;
 mod procgroup;
 mod search;
 mod stt;
@@ -687,6 +688,10 @@ pub fn run() {
             read_lines,
             edit_file,
             multi_edit,
+            chats::chat_write,
+            chats::chat_read,
+            chats::chat_delete,
+            chats::chat_names,
             search::grep_files,
             search::glob_files,
             run_command,

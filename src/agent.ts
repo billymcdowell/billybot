@@ -1,10 +1,12 @@
 import OpenAI from "openai";
 import { invoke } from "@tauri-apps/api/core";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
+import { stepLimitText } from "./history";
 import { resolveLimits } from "./limits";
 import { clipInstructions, formatInstructions, INSTRUCTIONS_FILE, type ProjectInstructions } from "./instructions";
 import { checkPermission } from "./permissions";
 import type { OpenProject, SubagentRun } from "./storage";
+import { textOf } from "./text";
 import { MAX_OPEN_PROJECTS } from "./tools/access";
 import { getTool, toolsFor } from "./tools";
 import { processResult, stagesFor, type ResultInfo } from "./tools/pipeline";
@@ -18,14 +20,7 @@ export const DEFAULT_MODEL = "anthropic/claude-sonnet-5.5";
 export const SUBAGENT_MODEL = "";
 const MAX_STEPS = 25; // per agent, so a confused model can't loop forever
 
-/** Message content can be a string or a list of parts; this returns the text. */
-export function textOf(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content.map((p) => (p && p.type === "text" ? p.text : "")).join("");
-  }
-  return "";
-}
+export { textOf };
 
 /**
  * Reads each project's CLAUDE.md, if it has one. It goes through the same locked read_file as
@@ -151,7 +146,7 @@ async function runSubagent(callId: string, project: string, task: string, o: Age
       },
     });
     run.report = textOf(run.messages[run.messages.length - 1]?.content) || "(no report)";
-    run.status = "done";
+    run.status = o.signal?.aborted ? "stopped" : "done"; // Stop makes the loop return rather than throw
   } catch (e) {
     run.status = o.signal?.aborted ? "stopped" : "failed";
     run.report = `Subagent ${run.status}: ${e instanceof Error ? e.message : String(e)}`;
@@ -176,30 +171,38 @@ export async function runAgent(o: AgentOptions): Promise<ChatCompletionMessagePa
     // The projects (and so their CLAUDE.md files) can change between steps, so read them each time.
     const instructions = await loadInstructions(o.workspace, o.projects);
     const system: ChatCompletionMessageParam = { role: "system", content: systemPrompt(o, instructions) };
-    const stream = await client.chat.completions.create(
-      { model: o.model, messages: [system, ...messages], tools, stream: true },
-      { signal: o.signal },
-    );
-
     let text = "";
     const calls: { id: string; name: string; args: string }[] = [];
-    for await (const chunk of stream) {
-      // OpenRouter reports token usage on the last chunk of a streamed reply.
-      if (chunk.usage) {
-        o.onUsage?.({ promptTokens: chunk.usage.prompt_tokens, completionTokens: chunk.usage.completion_tokens });
+    try {
+      const stream = await client.chat.completions.create(
+        { model: o.model, messages: [system, ...messages], tools, stream: true },
+        { signal: o.signal },
+      );
+      for await (const chunk of stream) {
+        // OpenRouter reports token usage on the last chunk of a streamed reply.
+        if (chunk.usage) {
+          o.onUsage?.({ promptTokens: chunk.usage.prompt_tokens, completionTokens: chunk.usage.completion_tokens });
+        }
+        const delta = chunk.choices[0]?.delta;
+        if (!delta) continue;
+        if (delta.content) {
+          text += delta.content;
+          o.onUpdate(messages, text);
+        }
+        for (const tc of delta.tool_calls ?? []) {
+          const call = (calls[tc.index] ??= { id: "", name: "", args: "" });
+          if (tc.id) call.id = tc.id;
+          if (tc.function?.name) call.name = tc.function.name;
+          if (tc.function?.arguments) call.args += tc.function.arguments;
+        }
       }
-      const delta = chunk.choices[0]?.delta;
-      if (!delta) continue;
-      if (delta.content) {
-        text += delta.content;
-        o.onUpdate(messages, text);
-      }
-      for (const tc of delta.tool_calls ?? []) {
-        const call = (calls[tc.index] ??= { id: "", name: "", args: "" });
-        if (tc.id) call.id = tc.id;
-        if (tc.function?.name) call.name = tc.function.name;
-        if (tc.function?.arguments) call.args += tc.function.arguments;
-      }
+    } catch (e) {
+      if (!o.signal?.aborted) throw e;
+      // The user pressed Stop. Keep what the model had said so far; a half-streamed tool call
+      // is dropped, since its arguments are incomplete and nothing ran.
+      if (text) messages.push({ role: "assistant", content: text });
+      o.onUpdate(messages, "");
+      return messages;
     }
     const toolCalls = calls.filter(Boolean);
 
@@ -239,6 +242,6 @@ export async function runAgent(o: AgentOptions): Promise<ChatCompletionMessagePa
     // 4. Loop: send the results back so the model can continue.
   }
 
-  messages.push({ role: "assistant", content: `Stopped after ${MAX_STEPS} steps.` });
+  messages.push({ role: "assistant", content: stepLimitText(MAX_STEPS) });
   return messages;
 }
