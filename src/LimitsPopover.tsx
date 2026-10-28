@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { Popover, PopoverContent, PopoverDescription, PopoverHeader, PopoverTitle, PopoverTrigger } from "@/components/ui/popover";
 import { DEFAULT_LIMITS, LIMIT_BOUNDS, resolveLimits, type Limits } from "./limits";
 
@@ -15,10 +16,15 @@ const FIELDS: { key: keyof Limits; label: string; unit: string }[] = [
   { key: "budgetUsd", label: "Budget for each chat (0 = none)", unit: "dollars" },
 ];
 
-type Props = { limits: Limits; onChange: (limits: Limits) => void };
+type Props = {
+  limits: Limits;
+  onChange: (limits: Limits) => void;
+  redact: boolean;
+  onRedactChange: (on: boolean) => void;
+};
 
 /** Header menu for the limits in src/limits.ts. A value is applied (and clamped) when you leave its box. */
-export default function LimitsPopover({ limits, onChange }: Props) {
+export default function LimitsPopover({ limits, onChange, redact, onRedactChange }: Props) {
   const [draft, setDraft] = useState<Record<string, string>>({});
   useEffect(() => setDraft({}), [limits]);
 
@@ -64,6 +70,16 @@ export default function LimitsPopover({ limits, onChange }: Props) {
               </span>
             </div>
           ))}
+          <div className="flex items-start gap-3">
+            <Switch id="redact" checked={redact} onCheckedChange={onRedactChange} />
+            <div className="flex flex-col gap-0.5">
+              <Label htmlFor="redact">Hide secrets from the model</Label>
+              <span className="text-xs text-muted-foreground">
+                Keys, tokens and passwords in files and command output are replaced with a placeholder before the model sees them.
+                It catches common formats, not everything.
+              </span>
+            </div>
+          </div>
           <Button size="sm" variant="outline" onClick={() => onChange({ ...DEFAULT_LIMITS })}>
             Reset to defaults
           </Button>

@@ -1,3 +1,5 @@
+import { redactWithCount } from "../redact";
+
 // Every tool result passes through these stages on its way back to the model. Later features
 // (secret redaction, the audit log) are added to DEFAULT_STAGES rather than to each tool.
 
@@ -5,6 +7,8 @@ export type ResultInfo = {
   tool: string;
   who: string;
   status: "ok" | "error" | "refused";
+  /** Stages add a line here when they change the result ("redacted 2 secrets"), for the activity log. */
+  notes?: string[];
 };
 
 export type ResultStage = (text: string, info: ResultInfo) => string | Promise<string>;
@@ -13,13 +17,23 @@ export type ResultStage = (text: string, info: ResultInfo) => string | Promise<s
 // everything else, such as a huge file from read_file.
 export const MAX_RESULT_CHARS = 100_000;
 
+/** Takes well-known secrets out of the result, so the model never sees them. */
+export function redactStage(): ResultStage {
+  return (text, info) => {
+    const { text: clean, count } = redactWithCount(text);
+    if (count > 0) info.notes?.push(`redacted ${count} ${count === 1 ? "secret" : "secrets"}`);
+    return clean;
+  };
+}
+
 /** Keeps the start and the end of an over-long result and says how much was removed. */
 export function truncateStage(max = MAX_RESULT_CHARS): ResultStage {
-  return (text) => {
+  return (text, info) => {
     if (text.length <= max) return text;
     const head = Math.floor(max * 0.75);
     const tail = max - head;
     const removed = text.length - head - tail;
+    info.notes?.push(`truncated ${removed.toLocaleString("en-US")} characters`);
     return (
       text.slice(0, head) +
       `\n[... ${removed.toLocaleString("en-US")} characters removed from the middle of this result. Ask for a smaller part if you need it ...]\n` +
@@ -28,9 +42,15 @@ export function truncateStage(max = MAX_RESULT_CHARS): ResultStage {
   };
 }
 
-/** The stages for one agent run, using the user's limits. */
-export function stagesFor(limits?: { maxResultChars?: number }): ResultStage[] {
-  return [truncateStage(limits?.maxResultChars ?? MAX_RESULT_CHARS)];
+/**
+ * The stages for one agent run. Redaction comes first, so a secret can't survive by being
+ * split across the point where a long result is cut.
+ */
+export function stagesFor(opts?: { maxResultChars?: number; redact?: boolean }): ResultStage[] {
+  return [
+    ...(opts?.redact === false ? [] : [redactStage()]),
+    truncateStage(opts?.maxResultChars ?? MAX_RESULT_CHARS),
+  ];
 }
 
 export const DEFAULT_STAGES: ResultStage[] = stagesFor();

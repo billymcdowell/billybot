@@ -1,3 +1,4 @@
+mod audit;
 mod chats;
 mod procgroup;
 mod search;
@@ -693,6 +694,8 @@ pub fn run() {
             chats::chat_delete,
             chats::chat_names,
             chats::write_export,
+            audit::audit_append,
+            audit::audit_read,
             search::grep_files,
             search::glob_files,
             run_command,

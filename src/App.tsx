@@ -4,6 +4,7 @@ import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import {
   AlertCircleIcon,
+  ActivityIcon,
   ArrowUpIcon,
   ChevronDownIcon,
   EyeIcon,
@@ -16,7 +17,7 @@ import {
   PlayIcon,
   PlusIcon,
   RefreshCwIcon,
-  RotateCcwIcon,
+  ShieldCheckIcon,
   SquareIcon,
   TerminalIcon,
   XIcon,
@@ -78,11 +79,14 @@ import { Switch } from "@/components/ui/switch";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { DEFAULT_MODEL, loadInstructions, runAgent, systemPrompt, toolsFor } from "./agent";
 import { textOf } from "./text";
+import ActivityPanel, { MAX_WIDTH, MIN_WIDTH } from "./ActivityPanel";
+import { makeEvent, mergeEvents, upsertEvent, type ActivityDraft, type ActivityEvent } from "./activity";
+import { flushActivity, loadChatActivity, saveActivity } from "./auditLog";
 import ChatList from "./ChatList";
 import CostChip, { budgetStep } from "./CostChip";
 import ContextMeter from "./ContextMeter";
 import { contextBreakdown } from "./context";
-import { addUsage, effectiveCap, emptyUsage, formatCost, type ChatUsage } from "./cost";
+import { addUsage, budgetState, effectiveCap, emptyUsage, formatCost, type ChatUsage } from "./cost";
 import ExportMenu from "./ExportMenu";
 import { chatToJson, chatToMarkdown, exportFileName } from "./exportChat";
 import { autoTitle, forkMessages, repairMessages, repairSubagents, runState, type RunState } from "./history";
@@ -96,10 +100,10 @@ import ThemeToggle from "./ThemeToggle";
 import { fetchToolModels, type ModelInfo } from "./models";
 import MessageList, { type EditingMessage } from "./Messages";
 import { polish, startRecording, transcribe, type Recording } from "./dictation";
-import { MODES, type Approval, type ApprovalRequest } from "./permissions";
+import { MODES, nextMode, type Approval, type ApprovalRequest } from "./permissions";
+import PermissionsDialog from "./PermissionsDialog";
 import { computerName, isWindows, keyStoreName } from "./platform";
 import {
-  clearAlwaysAllowed,
   deleteConversation,
   getSetting,
   listChats,
@@ -209,6 +213,7 @@ export default function App() {
   const modeRef = useRef<Mode>("ask");
   const [chats, setChats] = useState<ChatSummary[]>([]);
   const [chatId, setChatId] = useState(newId);
+  const chatIdRef = useRef(chatId); // the chat on screen, for code that outlives a render
   // What the open chat remembers besides its messages: a name the user chose, and whether it is pinned.
   const [chatMeta, setChatMeta] = useState<ChatMeta>({});
   const [usage, setUsage] = useState<ChatUsage>(emptyUsage());
@@ -221,6 +226,12 @@ export default function App() {
   const [closedMidRun, setClosedMidRun] = useState(false); // the open chat was cut off by the app closing
   const [fullOutput, setFullOutput] = useState(false); // exports: keep whole tool results
   const [notice, setNotice] = useState("");
+  const [permissionsOpen, setPermissionsOpen] = useState(false);
+  const [events, setEvents] = useState<ActivityEvent[]>([]); // the activity log for the chat on screen
+  const eventsRef = useRef<ActivityEvent[]>([]);
+  const [activityOpen, setActivityOpen] = useState(false);
+  const [activityWidth, setActivityWidth] = useState(420);
+  const warnedRef = useRef({ context: new Set<number>(), budget: false }); // each warning is logged once per chat
   const [stopped, setStopped] = useState(false); // the last run ended because Stop was pressed
   const [messages, setMessages] = useState<ChatCompletionMessageParam[]>([]);
   const [projects, setProjects] = useState<OpenProject[]>([]);
@@ -234,6 +245,7 @@ export default function App() {
   const [dictation, setDictation] = useState<"idle" | "recording" | "working">("idle");
   const [polishOn, setPolishOn] = useState(true);
   const [limits, setLimits] = useState<Limits>(DEFAULT_LIMITS);
+  const [redactOn, setRedactOn] = useState(true); // hide secrets from the model
   const recordingRef = useRef<Promise<Recording> | null>(null);
   const [contextWindow, setContextWindow] = useState<number | null>(null);
   const [instructions, setInstructions] = useState<ProjectInstructions[]>([]); // CLAUDE.md of the open projects
@@ -293,6 +305,16 @@ export default function App() {
     getSetting<Mode>("mode", "ask").then(changeMode);
     getSetting("polish", true).then(setPolishOn);
     getSetting<Partial<Limits>>("limits", {}).then((l) => setLimits(resolveLimits(l)));
+    getSetting("redact", true).then(setRedactOn);
+    getSetting("activityOpen", false).then(setActivityOpen);
+    getSetting("activityWidth", 420).then((w) => setActivityWidth(Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, w))));
+  }, []);
+
+  // Write any activity still waiting to be saved when the window closes (best effort).
+  useEffect(() => {
+    const flush = () => void flushActivity();
+    window.addEventListener("beforeunload", flush);
+    return () => window.removeEventListener("beforeunload", flush);
   }, []);
 
   // Load this workspace's chats.
@@ -321,10 +343,11 @@ export default function App() {
     };
   });
 
-  function changeMode(m: Mode) {
+  function changeMode(m: Mode, byUser = false) {
     modeRef.current = m;
     setMode(m);
     setSetting("mode", m);
+    if (byUser) emitEvent({ category: "chat", summary: `Mode changed to ${MODES.find((x) => x.id === m)?.label ?? m}` }, chatIdRef.current);
   }
 
   async function saveKey() {
@@ -362,8 +385,38 @@ export default function App() {
     setQueue(queueRef.current);
   }
 
+  /** Adds an event to the log for `forChat`: shown if that chat is on screen, and saved to the audit log. */
+  function emitEvent(draft: ActivityDraft, forChat: string) {
+    const event = makeEvent(draft, forChat);
+    if (forChat === chatIdRef.current) {
+      eventsRef.current = upsertEvent(eventsRef.current, event);
+      setEvents(eventsRef.current);
+    }
+    if (!event.pending) {
+      // Save the merged row (a finished event keeps the id and start time of the running one it replaced).
+      const merged = event.ref ? eventsRef.current.find((e) => e.ref === event.ref && e.chatId === forChat) : undefined;
+      saveActivity(merged ?? event);
+    }
+  }
+
+  /** Switches the log to another chat and loads that chat's saved events. */
+  function switchLog(id: string, load: boolean) {
+    chatIdRef.current = id;
+    eventsRef.current = [];
+    setEvents([]);
+    warnedRef.current = { context: new Set(), budget: false };
+    if (!load) return;
+    loadChatActivity(id).then((saved) => {
+      if (chatIdRef.current !== id) return; // you moved on while it loaded
+      eventsRef.current = mergeEvents(saved, eventsRef.current);
+      setEvents(eventsRef.current);
+    });
+  }
+
   function newChat() {
-    setChatId(newId());
+    const id = newId();
+    setChatId(id);
+    switchLog(id, false);
     setChatMeta({});
     setStopped(false);
     setClosedMidRun(false);
@@ -383,6 +436,7 @@ export default function App() {
     const fixed = repairMessages(c.messages);
     const subs = repairSubagents(c.subagents);
     setChatId(c.id);
+    switchLog(c.id, true);
     setChatMeta({ title: c.title, titleEdited: c.titleEdited, pinned: c.pinned, budgetExtra: c.budgetExtra, forkedFrom: c.forkedFrom });
     setStopped(c.stopped === true);
     setClosedMidRun(fixed.repaired || subs.repaired);
@@ -434,12 +488,6 @@ export default function App() {
   }
   function closeProject(name: string) {
     setProjects((ps) => ps.filter((p) => p.name !== name));
-  }
-
-  async function resetAlwaysAllow() {
-    if (!workspace) return;
-    await clearAlwaysAllowed(workspace);
-    for (const p of projects) await clearAlwaysAllowed(`${workspace}/${p.name}`);
   }
 
   // Agents call this and wait until you click a button on the approval card.
@@ -515,6 +563,13 @@ export default function App() {
     const last = messages[messages.length - 1];
     // If the last thing is your own message, it never got an answer: ask again rather than add another.
     run(last?.role === "user" ? messages : [...messages, { role: "user", content: "Continue." }]);
+  }
+
+  /** The agent proposed a plan in Plan mode; you're happy with it. Edits can go through now, commands still ask. */
+  function approvePlan() {
+    if (busy) return;
+    changeMode("acceptEdits", true);
+    run([...messages, { role: "user", content: "The plan is approved. Go ahead and carry it out." }]);
   }
 
   /** Raises this chat's budget and carries on. */
@@ -653,6 +708,16 @@ export default function App() {
     const meta = opts.meta ?? chatMeta;
     const turn = history.map((m) => m.role).lastIndexOf("user"); // costs are totalled per turn
     const chatCap = effectiveCap(limits.budgetUsd, meta.budgetExtra);
+    const emit = (draft: ActivityDraft) => emitEvent(draft, id);
+    const runRef = `run-${id}-${Date.now()}`;
+    let failure: string | undefined;
+    emit({
+      category: "run", ref: runRef, pending: true, summary: `Run started with ${model}`,
+      detail: {
+        mode: modeRef.current, messages: history.length, projects: projects.map((p) => `${p.name}${p.writable ? "" : " (read-only)"}`),
+        ...(chatCap > 0 ? { budget: chatCap } : {}),
+      },
+    });
 
     const snapshot = (wasStopped = false) =>
       buildConversation({ id, meta, messages: latest, projects: latestProjects, subagents: subs, usage: usageRef.current, stopped: wasStopped });
@@ -672,6 +737,7 @@ export default function App() {
       setChats(await listChats(workspace));
     } catch (e) {
       setError(`Couldn't save this chat: ${e instanceof Error ? e.message : String(e)}`);
+      emit({ category: "error", level: "error", summary: `Couldn't save this chat: ${e instanceof Error ? e.message : String(e)}` });
     }
 
     try {
@@ -686,6 +752,7 @@ export default function App() {
         },
         getMode: () => modeRef.current,
         limits,
+        redact: redactOn,
         messages: history,
         ask,
         signal: controller.signal,
@@ -703,8 +770,26 @@ export default function App() {
         onUsage: (u) => {
           if (u.role === "main") setLastUsage({ promptTokens: u.promptTokens, completionTokens: u.completionTokens });
           const price = modelsRef.current.find((m) => m.id === u.model);
-          setUsageBoth(addUsage(usageRef.current, u, price, turn));
+          const total = addUsage(usageRef.current, u, price, turn);
+          setUsageBoth(total);
+          // Say once when the conversation or the budget is getting full.
+          const warned = warnedRef.current;
+          if (u.role === "main" && contextWindow) {
+            for (const tier of [0.9, 0.7]) {
+              if (u.promptTokens / contextWindow >= tier && !warned.context.has(tier)) {
+                warned.context.add(tier);
+                if (tier === 0.9) warned.context.add(0.7);
+                emit({ category: "chat", level: "warn", summary: `The conversation fills ${Math.round((u.promptTokens / contextWindow) * 100)}% of the model's context` });
+                break;
+              }
+            }
+          }
+          if (!warned.budget && budgetState(total.cost, chatCap) === "warn") {
+            warned.budget = true;
+            emit({ category: "chat", level: "warn", summary: `This chat has used 80% of its ${formatCost(chatCap)} budget` });
+          }
         },
+        onEvent: emit,
         overBudget: () => (chatCap > 0 && usageRef.current.cost >= chatCap ? chatCap : null),
         takeSteering: () => {
           const mine = queueRef.current.filter((q) => q.steering);
@@ -714,7 +799,10 @@ export default function App() {
         },
       });
     } catch (e) {
-      if (!controller.signal.aborted) setError(e instanceof Error ? e.message : String(e));
+      if (!controller.signal.aborted) {
+        failure = e instanceof Error ? e.message : String(e);
+        setError(failure);
+      }
     } finally {
       if (timer) clearTimeout(timer);
       // A message sent "now" that the run finished before reading goes back to waiting its turn.
@@ -725,12 +813,35 @@ export default function App() {
       setMessages(latest);
       const wasStopped = controller.signal.aborted;
       setStopped(wasStopped);
+      const ending = runState(latest);
+      emit({
+        category: "run", ref: runRef,
+        level: failure ? "error" : wasStopped || ending !== "done" ? "warn" : "info",
+        summary: failure ? `Run failed: ${failure}`
+          : wasStopped ? "Run stopped by you"
+          : ending === "limit" ? "Run stopped at the step limit"
+          : ending === "budget" ? "Run stopped at the budget"
+          : ending === "done" ? "Run finished" : "Run ended without an answer",
+        detail: { messages: latest.length },
+      });
       try {
         await saveConversation(workspace, snapshot(wasStopped));
         setChats(await listChats(workspace));
       } catch (e) {
         setError(`Couldn't save this chat: ${e instanceof Error ? e.message : String(e)}`);
+        emit({ category: "error", level: "error", summary: `Couldn't save this chat: ${e instanceof Error ? e.message : String(e)}` });
       }
+    }
+  }
+
+  async function exportActivity(visible: ActivityEvent[]) {
+    try {
+      const path = await save({ defaultPath: exportFileName(`${chatMeta.title ?? autoTitle(messages)} activity`, "json"), filters: [{ name: "JSON", extensions: ["json"] }] });
+      if (!path) return;
+      await invoke("write_export", { path, contents: JSON.stringify(visible, null, 2) });
+      setNotice(`Saved ${baseName(path)}.`);
+    } catch (e) {
+      setError(`Export: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -848,16 +959,16 @@ export default function App() {
           <SidebarFooter>
             <SidebarMenu>
               <SidebarMenuItem>
-                <SidebarMenuButton size="sm" onClick={resetAlwaysAllow}>
-                  <RotateCcwIcon />
-                  <span>Reset "always allow"</span>
+                <SidebarMenuButton size="sm" onClick={() => setPermissionsOpen(true)}>
+                  <ShieldCheckIcon />
+                  <span>Always allowed…</span>
                 </SidebarMenuButton>
               </SidebarMenuItem>
             </SidebarMenu>
           </SidebarFooter>
         </Sidebar>
 
-        <SidebarInset className="flex h-svh flex-col">
+        <SidebarInset className="flex h-svh min-w-0 flex-col">
           <header className="flex items-center gap-2 border-b px-3 py-2">
             <SidebarTrigger />
             <Separator orientation="vertical" className="h-4" />
@@ -905,6 +1016,19 @@ export default function App() {
                 }}
               />
               <Label htmlFor="polish">Polish dictation</Label>
+              <Button
+                size="icon-xs"
+                variant={activityOpen ? "default" : "outline"}
+                aria-label="Activity log"
+                aria-pressed={activityOpen}
+                title="Activity log: everything the agent is doing"
+                onClick={() => {
+                  setActivityOpen(!activityOpen);
+                  setSetting("activityOpen", !activityOpen);
+                }}
+              >
+                <ActivityIcon />
+              </Button>
               <CostChip usage={usage} cap={cap} onAddBudget={addBudget} disabled={busy} />
               <ExportMenu
                 disabled={messages.length === 0}
@@ -913,6 +1037,11 @@ export default function App() {
                 onExport={exportChat}
               />
               <LimitsPopover
+                redact={redactOn}
+                onRedactChange={(on) => {
+                  setRedactOn(on);
+                  setSetting("redact", on);
+                }}
                 limits={limits}
                 onChange={(l) => {
                   setLimits(l);
@@ -974,6 +1103,12 @@ export default function App() {
                       {messages[messages.length - 1]?.role === "user" ? "Retry" : "Continue"}
                     </Button>
                   )
+                )}
+                {mode === "plan" && state === "done" && (
+                  <Button size="sm" onClick={approvePlan} title="Switch to Auto-accept edits and tell the agent to go ahead">
+                    <PlayIcon />
+                    Approve plan
+                  </Button>
                 )}
                 <Button size="sm" variant="ghost" onClick={regenerate} title="Throw away the last reply and ask again">
                   <RefreshCwIcon />
@@ -1057,6 +1192,7 @@ export default function App() {
                   </ItemTitle>
                   <ItemDescription>
                     {pending.req.who} · {pending.req.where}
+                    {pending.req.mode && ` · ${MODES.find((m) => m.id === pending.req.mode)?.label ?? ""}`}
                     {approvals.length > 1 && ` · ${approvals.length - 1} more waiting`}
                   </ItemDescription>
                 </ItemContent>
@@ -1070,8 +1206,8 @@ export default function App() {
                       {pending.req.where === "workspace" ? "Always allow creating" : `Always in ${pending.req.where}`}
                     </Button>
                   )}
-                  <Button size="sm" onClick={() => answer("once")}>
-                    Approve
+                  <Button size="sm" variant={pending.req.danger ? "destructive" : "default"} onClick={() => answer("once")}>
+                    {pending.req.danger ? "Approve anyway" : "Approve"}
                   </Button>
                 </ItemActions>
                 {pending.req.tool === "write_file" && (
@@ -1090,6 +1226,17 @@ export default function App() {
                         {String(pending.req.args.command ?? "")}
                       </CodeBlockContent>
                     </CodeBlock>
+                    {pending.req.danger && (
+                      <p className="rounded-md border border-red-500/40 bg-red-500/10 px-2 py-1 text-xs text-red-600 dark:text-red-400">
+                        <strong>Flagged: </strong>
+                        {pending.req.danger} This check is a guardrail, not a guarantee: read the command yourself.
+                      </p>
+                    )}
+                    {pending.req.warning && (
+                      <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs text-amber-700 dark:text-amber-400">
+                        {pending.req.warning}
+                      </p>
+                    )}
                     <p className="text-xs text-muted-foreground">
                       Runs on your {computerName} as you, starting in {pending.req.where}. The folder lock does not apply to commands:
                       they can reach any file your account can.
@@ -1128,7 +1275,10 @@ export default function App() {
                   className="p-3"
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
+                    if (e.key === "Tab" && e.shiftKey) {
+                      e.preventDefault();
+                      changeMode(nextMode(mode), true);
+                    } else if (e.key === "Enter" && !e.shiftKey) {
                       e.preventDefault();
                       send();
                     }
@@ -1137,16 +1287,19 @@ export default function App() {
                 <InputGroupAddon align="block-end">
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
-                      <InputGroupButton size="sm">
+                      <InputGroupButton size="sm" className={MODES.find((m) => m.id === mode)?.tone} title="Permission mode (Shift+Tab to change)">
                         {MODES.find((m) => m.id === mode)?.label}
                         <ChevronDownIcon />
                       </InputGroupButton>
                     </DropdownMenuTrigger>
-                    <DropdownMenuContent align="start">
-                      <DropdownMenuRadioGroup value={mode} onValueChange={(v) => changeMode(v as Mode)}>
+                    <DropdownMenuContent align="start" className="w-72">
+                      <DropdownMenuRadioGroup value={mode} onValueChange={(v) => changeMode(v as Mode, true)}>
                         {MODES.map((m) => (
-                          <DropdownMenuRadioItem key={m.id} value={m.id}>
-                            {m.label}
+                          <DropdownMenuRadioItem key={m.id} value={m.id} className="items-start">
+                            <span className="flex flex-col">
+                              <span className={m.tone}>{m.label}</span>
+                              <span className="text-xs font-normal text-muted-foreground">{m.hint}</span>
+                            </span>
                           </DropdownMenuRadioItem>
                         ))}
                       </DropdownMenuRadioGroup>
@@ -1199,7 +1352,29 @@ export default function App() {
             </form>
           </div>
         </SidebarInset>
+
+        {activityOpen && (
+          <ActivityPanel
+            events={events}
+            width={activityWidth}
+            onWidthChange={(w, final) => {
+              setActivityWidth(w);
+              if (final) setSetting("activityWidth", w);
+            }}
+            onClose={() => {
+              setActivityOpen(false);
+              setSetting("activityOpen", false);
+            }}
+            onClear={() => {
+              eventsRef.current = [];
+              setEvents([]);
+            }}
+            onExport={exportActivity}
+          />
+        )}
       </SidebarProvider>
+
+      <PermissionsDialog open={permissionsOpen} onOpenChange={setPermissionsOpen} workspace={workspace} />
 
       <AlertDialog open={editChoice !== null} onOpenChange={(open) => !open && setEditChoice(null)}>
         <AlertDialogContent>

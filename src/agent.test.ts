@@ -454,3 +454,274 @@ describe("messages sent while the agent works", () => {
     expect(takeSteering).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("secrets", () => {
+  const KEY = "sk-or-v1-0123456789abcdef0123456789abcdef";
+
+  it("hides secrets in a tool result from the model", async () => {
+    backend({ read_lines: () => `OPENROUTER_API_KEY=${KEY}\nPORT=3000` });
+    const out = await run([useTools(call("read_file", { path: "app/.env" })), say("ok")]);
+    expect(toolResults(out)[0]).toBe("OPENROUTER_API_KEY=[REDACTED:api-key]\nPORT=3000");
+    expect(JSON.stringify(client.requests[1].messages)).not.toContain("0123456789abcdef");
+  });
+
+  it("hides them in command output too", async () => {
+    backend({ run_command: () => `Exit code 0\nexport AWS=AKIAIOSFODNN7EXAMPLE` });
+    const out = await run([useTools(call("run_command", { project: "app", command: "env" })), say("ok")]);
+    expect(toolResults(out)[0]).toContain("[REDACTED:aws-key]");
+  });
+
+  it("leaves results alone when redaction is off", async () => {
+    backend({ read_lines: () => KEY });
+    const out = await run([useTools(call("read_file", { path: "app/a" })), say("ok")], { redact: false });
+    expect(toolResults(out)[0]).toBe(KEY);
+  });
+
+  it("refuses to write a placeholder back, before asking the user anything", async () => {
+    const { ask } = recordingAsk();
+    const edits = [{ old_text: "a", new_text: "TOKEN=[REDACTED:env-secret]" }];
+    const out = await run(
+      [
+        useTools(
+          call("write_file", { path: "app/.env", content: "TOKEN=[REDACTED:env-secret]" }, "w"),
+          call("edit_file", { path: "app/.env", old_text: "[REDACTED:api-key]", new_text: "x" }, "e"),
+          call("multi_edit", { path: "app/.env", edits }, "m"),
+        ),
+        say("ok"),
+      ],
+      { ask },
+      "ask",
+    );
+    expect(ask).not.toHaveBeenCalled();
+    expect(toolResults(out)).toHaveLength(3);
+    for (const r of toolResults(out)) expect(r).toMatch(/^Error: Refused: the text contains a \[REDACTED/);
+    expect(invokeMock).not.toHaveBeenCalledWith("write_file", expect.anything());
+  });
+
+  it("allows placeholders when redaction is off, and ordinary text that merely mentions the word", async () => {
+    backend({ write_file: () => "Wrote", read_file: () => "" });
+    const out = await run(
+      [useTools(call("write_file", { path: "app/a", content: "[REDACTED:x]" }, "w1"), call("write_file", { path: "app/b", content: "REDACTED is a word" }, "w2")), say("ok")],
+      { redact: false },
+    );
+    expect(toolResults(out)).toEqual(["Wrote", "Wrote"]);
+    const normal = await run([useTools(call("write_file", { path: "app/b", content: "REDACTED is a word" })), say("ok")]);
+    expect(toolResults(normal)[0]).toBe("Wrote");
+  });
+});
+
+describe("the dangerous-command guard", () => {
+  it("makes a flagged command ask even in Bypass, and shows why", async () => {
+    backend({ run_command: () => "Exit code 0" });
+    const { ask, asked } = recordingAsk("once");
+    const out = await run([useTools(call("run_command", { project: "app", command: "git push --force" })), say("ok")], { ask }, "bypass");
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toMatchObject({ tool: "run_command", mode: "bypass" });
+    expect(asked[0].danger).toMatch(/force-pushes/);
+    expect(toolResults(out)[0]).toBe("Exit code 0");
+  });
+
+  it("does not run it if you say no", async () => {
+    backend({ run_command: () => "Exit code 0" });
+    const out = await run([useTools(call("run_command", { project: "app", command: "rm -rf ~" })), say("ok")], { ask: recordingAsk("deny").ask }, "bypass");
+    expect(toolResults(out)[0]).toBe("The user denied this action.");
+    expect(invokeMock).not.toHaveBeenCalledWith("run_command", expect.anything());
+  });
+
+  it("leaves ordinary commands alone in Bypass", async () => {
+    backend({ run_command: () => "Exit code 0" });
+    const { ask } = recordingAsk();
+    await run([useTools(call("run_command", { project: "app", command: "npm test" })), say("ok")], { ask }, "bypass");
+    expect(ask).not.toHaveBeenCalled();
+  });
+
+  it("warns when a command contains a key, without forcing a prompt in Bypass", async () => {
+    backend({ run_command: () => "Exit code 0" });
+    const { ask } = recordingAsk();
+    await run([useTools(call("run_command", { project: "app", command: "curl -H 'Authorization: sk-or-v1-0123456789abcdef0123456789abcdef' x" })), say("ok")], { ask }, "bypass");
+    expect(ask).not.toHaveBeenCalled();
+    const { ask: ask2, asked } = recordingAsk();
+    await run([useTools(call("run_command", { project: "app", command: "echo sk-or-v1-0123456789abcdef0123456789abcdef" })), say("ok")], { ask: ask2 }, "ask");
+    expect(asked[0].warning).toMatch(/key or password/);
+  });
+});
+
+describe("activity events", () => {
+  const collect = () => {
+    const events: import("./activity").ActivityDraft[] = [];
+    return { events, onEvent: (e: import("./activity").ActivityDraft) => void events.push(e) };
+  };
+  const byRef = (events: import("./activity").ActivityDraft[], ref: string) => events.filter((e) => e.ref === ref);
+
+  it("logs each request: asked, then answered with tokens, cost and timing", async () => {
+    const { events, onEvent } = collect();
+    await run([{ text: "hi", usage: { prompt: 120, completion: 8, cost: 0.003 } }], { onEvent });
+    const requests = events.filter((e) => e.category === "request");
+    expect(requests).toHaveLength(2);
+    expect(requests[0]).toMatchObject({ pending: true, summary: "Asking m (step 1)", who: "Main agent", depth: 0 });
+    expect(requests[1].ref).toBe(requests[0].ref);
+    expect(requests[1]).toMatchObject({ summary: "m replied: 2 characters of text" });
+    expect(requests[1].detail).toMatchObject({ inputTokens: 120, outputTokens: 8, cost: 0.003, textChars: 2 });
+    expect(requests[1].durationMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("logs a tool call as a running row that is replaced by its outcome", async () => {
+    backend({ read_lines: () => "file text" });
+    const { events, onEvent } = collect();
+    await run([useTools(call("read_file", { path: "app/a.ts" }, "t1")), say("ok")], { onEvent });
+    const rows = byRef(events, "t1");
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ category: "tool", pending: true, summary: "read_file path=app/a.ts" });
+    expect(rows[1]).toMatchObject({ category: "tool", level: "info", summary: "read_file path=app/a.ts → ok, 9 chars" });
+    expect(rows[1].detail).toMatchObject({ decision: "auto", status: "ok", resultChars: 9, sentToModelChars: 9, preview: "file text" });
+  });
+
+  it("never puts file contents in the log", async () => {
+    backend({ write_file: () => "Wrote", read_file: () => "" });
+    const { events, onEvent } = collect();
+    await run([useTools(call("write_file", { path: "app/a.ts", content: "SECRET BODY ".repeat(50) }, "w")), say("ok")], { onEvent });
+    expect(JSON.stringify(events)).not.toContain("SECRET BODY");
+    expect(byRef(events, "w")[1].summary).toContain("content=(600 chars)");
+  });
+
+  it("notes when a result was changed on its way to the model", async () => {
+    backend({ read_lines: () => "TOKEN=abc123\n" + "x".repeat(200_000) });
+    const { events, onEvent } = collect();
+    await run([useTools(call("read_file", { path: "app/.env" }, "t1")), say("ok")], { onEvent });
+    const done = byRef(events, "t1")[1];
+    expect(done.detail!.changes).toEqual(["redacted 1 secret", expect.stringContaining("truncated")]);
+    expect(done.detail!.resultChars).toBeGreaterThan(200_000);
+    expect(done.detail!.sentToModelChars).toBeLessThan(101_000);
+  });
+
+  it("records an approval: waiting, then your answer and how long it took", async () => {
+    backend({ write_file: () => "Wrote", read_file: () => null });
+    const { events, onEvent } = collect();
+    await run([useTools(call("write_file", { path: "app/a", content: "x" }, "t1")), say("ok")], { onEvent, ask: recordingAsk("once").ask }, "ask");
+    const approval = byRef(events, "approval-t1");
+    expect(approval).toHaveLength(2);
+    expect(approval[0]).toMatchObject({ category: "approval", pending: true, summary: "Waiting for your approval: write_file" });
+    expect(approval[1]).toMatchObject({ summary: "You approved: write_file", level: "info" });
+    expect(approval[1].detail).toMatchObject({ tool: "write_file", mode: "ask" });
+    expect(typeof approval[1].detail!.waitedMs).toBe("number");
+    expect(byRef(events, "t1")[1].detail).toMatchObject({ decision: "approved" });
+  });
+
+  it("records a denial, and a refusal that never asked", async () => {
+    backend({ write_file: () => "Wrote", read_file: () => null });
+    const denied = collect();
+    await run([useTools(call("write_file", { path: "app/a", content: "x" }, "t1")), say("ok")], { onEvent: denied.onEvent, ask: recordingAsk("deny").ask }, "ask");
+    expect(byRef(denied.events, "approval-t1")[1]).toMatchObject({ level: "warn", summary: "You denied: write_file" });
+    expect(byRef(denied.events, "t1")[1]).toMatchObject({ level: "warn", summary: expect.stringContaining("you denied it") });
+
+    const refused = collect();
+    await run([useTools(call("write_file", { path: "app/a", content: "x" }, "t2")), say("ok")], { onEvent: refused.onEvent }, "readOnly");
+    expect(byRef(refused.events, "approval-t2")).toHaveLength(0);
+    expect(byRef(refused.events, "t2")[1]).toMatchObject({ level: "warn", summary: expect.stringContaining("refused") });
+    expect(byRef(refused.events, "t2")[1].detail).toMatchObject({ decision: "refused", status: "refused" });
+  });
+
+  it("logs commands with their exit code, and flags dangerous ones", async () => {
+    backend({ run_command: () => "Exit code 2\nboom" });
+    const { events, onEvent } = collect();
+    await run([useTools(call("run_command", { project: "app", command: "sudo make" }, "c1")), say("ok")], { onEvent, ask: recordingAsk("once").ask }, "bypass");
+    const done = byRef(events, "c1")[1];
+    expect(done).toMatchObject({ category: "command", level: "warn", summary: expect.stringContaining("→ exit 2") });
+    expect(done.detail).toMatchObject({ exitCode: 2, decision: "approved" });
+    expect(done.detail!.flagged).toMatch(/administrator/);
+    expect(byRef(events, "approval-c1")[0].level).toBe("warn");
+  });
+
+  it("logs errors", async () => {
+    const { events, onEvent } = collect();
+    await run([useTools(call("nope", {}, "t1")), say("ok")], { onEvent });
+    expect(last(byRef(events, "t1"))).toMatchObject({ level: "error", summary: expect.stringContaining("Unknown tool: nope") });
+  });
+
+  it("logs a failed request and rethrows", async () => {
+    client = { requests: [], create: vi.fn(async () => { throw new Error("401 bad key"); }) } as never;
+    const { events, onEvent } = collect();
+    await expect(runAgent(options({ onEvent }))).rejects.toThrow("401 bad key");
+    expect(events[events.length - 1]).toMatchObject({ category: "request", level: "error", summary: "Request to m failed: 401 bad key" });
+  });
+
+  it("logs a subagent's work nested under it", async () => {
+    backend({ check_project: () => undefined, list_dir: () => ["a.ts"] });
+    const { events, onEvent } = collect();
+    const replies = [useTools(call("list_dir", { path: "app" }, "s1")), say("all done")];
+    await run([useTools(call("delegate_task", { project: "app", task: "look around" }, "d1")), say("ok")], { onEvent }, "bypass", () => replies.shift()!);
+    const sub = byRef(events, "subagent-d1");
+    expect(sub[0]).toMatchObject({ category: "subagent", pending: true, summary: "Subagent for app: look around", who: "Main agent" });
+    expect(sub[1]).toMatchObject({ summary: "Subagent for app done", level: "info" });
+    const inner = byRef(events, "s1");
+    expect(inner[0]).toMatchObject({ who: "app agent", depth: 1 });
+    const requests = events.filter((e) => e.category === "request" && e.who === "app agent");
+    expect(requests.length).toBeGreaterThan(0);
+    expect(requests.every((e) => e.depth === 1)).toBe(true);
+  });
+
+  it("logs a budget stop, a step limit and a steering message", async () => {
+    const budget = collect();
+    await run([say("never")], { onEvent: budget.onEvent, overBudget: () => 2 });
+    expect(budget.events[0]).toMatchObject({ category: "chat", level: "warn", summary: expect.stringContaining("$2.00 budget") });
+
+    backend({ list_projects: () => [] });
+    const limit = collect();
+    await run(Array.from({ length: 30 }, () => useTools(call("list_projects"))), { onEvent: limit.onEvent });
+    expect(limit.events.filter((e) => e.category === "chat")[0]).toMatchObject({ level: "warn", summary: "Stopped after 25 steps (the limit for one run)" });
+
+    const steer = collect();
+    const queue = ["also add tests"];
+    await run([useTools(call("list_projects")), say("ok")], { onEvent: steer.onEvent, takeSteering: () => queue.splice(0) });
+    expect(steer.events.find((e) => e.category === "chat")).toMatchObject({ summary: "A message you queued joined the run", detail: { text: "also add tests" } });
+  });
+
+  it("logs a cancelled request when you press Stop", async () => {
+    const controller = new AbortController();
+    client = {
+      requests: [],
+      create: vi.fn(async () => (async function* () { yield { choices: [{ delta: { content: "par" } }] }; controller.abort(); throw new DOMException("Aborted", "AbortError"); })()),
+    } as never;
+    const { events, onEvent } = collect();
+    await runAgent(options({ onEvent, signal: controller.signal }));
+    expect(events[events.length - 1]).toMatchObject({ category: "request", level: "warn", summary: "Request to m cancelled", detail: { charsReceived: 3 } });
+  });
+});
+
+describe("plan mode", () => {
+  it("tells the model it is planning, only while the mode is Plan", async () => {
+    await run([say("a plan")], {}, "plan");
+    expect(String(client.requests[0].messages[0].content)).toContain("PLAN MODE is on");
+    await run([say("done")], {}, "ask");
+    expect(String(client.requests[0].messages[0].content)).not.toContain("PLAN MODE");
+    expect(systemPrompt({ role: "sub", workspace: "/ws", projects: [{ name: "app", writable: true }], getMode: () => "plan" })).not.toContain("PLAN MODE");
+  });
+
+  it("refuses changes and commands but lets it read and search", async () => {
+    backend({ read_lines: () => "text", grep_files: () => "app/a:1: hit", write_file: () => "Wrote", run_command: () => "Exit code 0" });
+    const { ask } = recordingAsk();
+    const out = await run(
+      [useTools(
+        call("read_file", { path: "app/a" }, "r"), call("grep", { pattern: "x", path: "app" }, "g"),
+        call("write_file", { path: "app/a", content: "x" }, "w"), call("run_command", { project: "app", command: "ls" }, "c"),
+      ), say("my plan")],
+      { ask }, "plan",
+    );
+    const results = toolResults(out);
+    expect(results.slice(0, 2)).toEqual(["text", "app/a:1: hit"]);
+    expect(results[2]).toMatch(/^Plan mode is on/);
+    expect(results[3]).toMatch(/^Plan mode is on/);
+    expect(ask).not.toHaveBeenCalled();
+    expect(invokeMock).not.toHaveBeenCalledWith("write_file", expect.anything());
+  });
+
+  it("notices a mode change between steps", async () => {
+    backend({ write_file: () => "Wrote", read_file: () => null, list_projects: () => [] });
+    let mode: Mode = "plan";
+    client = fakeClient([useTools(call("list_projects")), useTools(call("write_file", { path: "app/a", content: "x" })), say("ok")]);
+    const out = await runAgent({ ...options(), getMode: () => mode, onUpdate: (m) => { if (m.length === 3) mode = "bypass"; } });
+    expect(String(client.requests[0].messages[0].content)).toContain("PLAN MODE");
+    expect(String(client.requests[1].messages[0].content)).not.toContain("PLAN MODE");
+    expect(toolResults(out)[1]).toBe("Wrote");
+  });
+});

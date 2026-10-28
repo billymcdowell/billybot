@@ -2,7 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { fn } from "./define";
 import { need, openProjectFor, pp } from "./access";
 import { parseEdits } from "../edits";
-import type { Tool, ToolArgs } from "./types";
+import { hasPlaceholder } from "../redact";
+import type { AgentOptions, Tool, ToolArgs } from "./types";
 
 const path = {
   type: "string",
@@ -10,6 +11,19 @@ const path = {
 };
 
 const filePath = (args: ToolArgs) => String(args.path ?? "");
+
+/**
+ * Secrets are hidden from the model and replaced with a [REDACTED:…] placeholder. If it wrote
+ * one back into a file it would replace the real value, so that is refused before anything is asked.
+ */
+function refusePlaceholders(o: AgentOptions, ...texts: unknown[]) {
+  if (o.redact === false) return;
+  if (texts.some((t) => typeof t === "string" && hasPlaceholder(t))) {
+    throw new Error(
+      "Refused: the text contains a [REDACTED:…] placeholder. Secrets are hidden from you, so a placeholder stands in for a real value you can't see, and writing it would replace the real value in the file. Leave that part of the file as it is, or ask the user to change it themselves.",
+    );
+  }
+}
 
 export const fileTools: Tool[] = [
   {
@@ -59,7 +73,10 @@ export const fileTools: Tool[] = [
     category: "write",
     roles: ["main", "sub"],
     parallelSafe: false,
-    target: (args, o) => openProjectFor(true, filePath(args), o),
+    target: (args, o) => {
+      refusePlaceholders(o, args.content);
+      return openProjectFor(true, filePath(args), o);
+    },
     // For a full rewrite, fetch the current text so the approval card can show what changes.
     preview: (_args, t, o) => invoke<string>("read_file", { workspace: o.workspace, ...pp(need(t)) }).catch(() => null),
     run: (args, t, { o }) =>
@@ -80,7 +97,10 @@ export const fileTools: Tool[] = [
     category: "write",
     roles: ["main", "sub"],
     parallelSafe: false,
-    target: (args, o) => openProjectFor(true, filePath(args), o),
+    target: (args, o) => {
+      refusePlaceholders(o, args.old_text, args.new_text);
+      return openProjectFor(true, filePath(args), o);
+    },
     run: (args, t, { o }) =>
       invoke<string>("edit_file", {
         workspace: o.workspace,
@@ -115,7 +135,8 @@ export const fileTools: Tool[] = [
     roles: ["main", "sub"],
     parallelSafe: false,
     target: (args, o) => {
-      parseEdits(args.edits); // a malformed call is the model's mistake: say so before asking the user anything
+      const edits = parseEdits(args.edits); // a malformed call is the model's mistake: say so before asking the user anything
+      refusePlaceholders(o, ...edits.flatMap((e) => [e.old_text, e.new_text]));
       return openProjectFor(true, filePath(args), o);
     },
     preview: (_args, t, o) => invoke<string>("read_file", { workspace: o.workspace, ...pp(need(t)) }).catch(() => null),

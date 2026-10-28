@@ -16,13 +16,23 @@ const RULES: { name: string; pattern: RegExp; replace?: (...m: string[]) => stri
   },
 ];
 
-export function redactText(text: string): string {
+/** Redacts `text` and says how many secrets were removed. */
+export function redactWithCount(text: string): { text: string; count: number } {
   let out = text;
+  let count = 0;
   for (const rule of RULES) {
-    out = out.replace(rule.pattern, rule.replace ?? (() => `[REDACTED:${rule.name}]`));
+    out = out.replace(rule.pattern, (...m) => {
+      count++;
+      return rule.replace ? rule.replace(...(m as string[])) : `[REDACTED:${rule.name}]`;
+    });
   }
-  return out;
+  return { text: out, count };
 }
+
+export const redactText = (text: string): string => redactWithCount(text).text;
+
+/** True if the text contains a placeholder left by redaction. */
+export const hasPlaceholder = (text: string): boolean => /\[REDACTED:[a-z-]+\]/.test(text);
 
 /** Redacts every string inside a value made of objects, arrays and strings. */
 export function redactDeep<T>(value: T): T {

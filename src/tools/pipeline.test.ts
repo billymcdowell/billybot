@@ -41,3 +41,35 @@ describe("processResult", () => {
     expect(await processResult("a", info, [slow])).toBe("A");
   });
 });
+
+import { redactStage, stagesFor } from "./pipeline";
+
+describe("redaction stage", () => {
+  const KEY = "sk-or-v1-0123456789abcdef0123456789abcdef";
+
+  it("removes secrets and notes how many", async () => {
+    const info: ResultInfo = { tool: "read_file", who: "Main agent", status: "ok", notes: [] };
+    const out = await processResult(`A=${KEY}\nTOKEN=abc\nfine`, info, [redactStage()]);
+    expect(out).toBe("A=[REDACTED:api-key]\nTOKEN=[REDACTED:env-secret]\nfine");
+    expect(info.notes).toEqual(["redacted 2 secrets"]);
+  });
+
+  it("says nothing when there is nothing to remove", async () => {
+    const info: ResultInfo = { tool: "t", who: "w", status: "ok", notes: [] };
+    await processResult("plain", info, [redactStage()]);
+    expect(info.notes).toEqual([]);
+  });
+
+  it("runs before the cut, so a secret can't survive by straddling it", async () => {
+    const text = "x".repeat(740) + " " + KEY + " " + "y".repeat(5000);
+    const info: ResultInfo = { tool: "t", who: "w", status: "ok", notes: [] };
+    const out = await processResult(text, info, stagesFor({ maxResultChars: 1000 }));
+    expect(out).not.toContain("0123456789abcdef");
+    expect(info.notes).toEqual(["redacted 1 secret", expect.stringContaining("truncated")]);
+  });
+
+  it("can be switched off", async () => {
+    const out = await processResult(KEY, { tool: "t", who: "w", status: "ok" }, stagesFor({ redact: false }));
+    expect(out).toBe(KEY);
+  });
+});

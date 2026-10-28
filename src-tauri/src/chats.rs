@@ -15,11 +15,12 @@ use std::path::{Path, PathBuf};
 use tauri::Manager;
 
 /// A file name is letters, digits, `-` and `_` only. Chat ids are UUIDs; the index is `_index`.
+pub(crate) fn is_valid_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 100 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 fn check_name(name: &str) -> Result<(), String> {
-    let ok = !name.is_empty()
-        && name.len() <= 100
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    if ok { Ok(()) } else { Err(format!("\"{name}\" is not a valid chat name")) }
+    if is_valid_name(name) { Ok(()) } else { Err(format!("\"{name}\" is not a valid chat name")) }
 }
 
 /// 64-bit FNV-1a. Not for security: it only has to be the same on every run and platform,

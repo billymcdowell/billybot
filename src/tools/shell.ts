@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
+import { dangerousReason } from "../dangerous";
 import { resolveLimits } from "../limits";
 import { isWindows } from "../platform";
+import { redactWithCount } from "../redact";
 import { need, openProjectForCommand } from "./access";
 import { fn } from "./define";
 import type { Tool } from "./types";
@@ -28,6 +30,15 @@ export const shellTools: Tool[] = [
     parallelSafe: false,
     subagentRefusal: "Subagents cannot run commands.",
     target: (args, o) => openProjectForCommand(String(args.project ?? ""), o),
+    risk: (args) => {
+      const command = String(args.command ?? "");
+      const danger = dangerousReason(command);
+      const hasSecret = redactWithCount(command).count > 0;
+      return {
+        ...(danger ? { danger } : {}),
+        ...(hasSecret ? { warning: "This command contains something that looks like a key or password." } : {}),
+      };
+    },
     run: (args, t, { o }) => {
       const limits = resolveLimits(o.limits);
       return invoke<string>("run_command", {

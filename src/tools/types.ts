@@ -1,4 +1,5 @@
 import type { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/chat/completions";
+import type { ActivityDraft } from "../activity";
 import type { UsageEvent } from "../cost";
 import type { Limits } from "../limits";
 import type { AskFn, ToolCategory } from "../permissions";
@@ -24,6 +25,9 @@ export type AgentOptions = {
   // Messages the user sent while the agent was working; asked for before each step (main agent only).
   takeSteering?: () => string[];
   signal?: AbortSignal;
+  // Everything the agent does, for the activity log. Subagents inherit it and mark theirs with a depth.
+  onEvent?: (event: ActivityDraft) => void;
+  redact?: boolean; // hide secrets from the model (default true)
   limits?: Partial<Limits>; // see src/limits.ts; missing values use the defaults
   role?: AgentRole;
   who?: string; // shown on approval cards
@@ -55,6 +59,8 @@ export type Tool = {
   subagentRefusal?: string;
   /** Checks the call against the open projects (throws a helpful error if not allowed). Omit for workspace-level tools. */
   target?: (args: ToolArgs, o: AgentOptions) => Target;
+  /** Extra checks on a call, shown on the approval card. `danger` makes the call ask even in Bypass mode. */
+  risk?: (args: ToolArgs) => { danger?: string; warning?: string };
   /** Text to show on the approval card as "before", or null if there is none. */
   preview?: (args: ToolArgs, target: Target | null, o: AgentOptions) => Promise<string | null>;
   run: (args: ToolArgs, target: Target | null, ctx: ToolContext) => Promise<string>;

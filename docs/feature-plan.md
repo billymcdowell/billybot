@@ -144,10 +144,37 @@ Add `schemaVersion` to the chat file and a one-time migration from the old `chat
 - Be honest in the UI and docs: this is a guardrail, not a security boundary. Shell commands can be obfuscated (`r""m`, variables, base64). Real containment is idea 20.
 - **Tests:** a table of command strings → flagged/not flagged, including near-misses (`rm -rf ./build` is fine to prompt normally; `rm -rf ~` is flagged).
 
-### 22. Audit log (M, uses 0.3 and 0.4)
+### 22. Audit log (M, uses 0.3 and 0.4; built with the activity panel, 22a)
 - Rust `audit_append` writes one JSON line per tool call to `audit/<yyyy-mm>.jsonl`: time, chat id, workspace, project, who (main / subagent), tool, args (redacted, large content replaced by length + hash), mode, decision (`auto`, `approved`, `always`, `denied`, `refused`), result status, duration, bytes.
 - Never log API keys or full file contents.
 - UI: a log viewer (table with filters by tool, decision and chat, plus search) and an Export button. Rotation by month; a "delete logs older than N days" setting.
+
+### 22a. Activity panel (L, built together with 22)
+A live log of everything the app and agent are doing, in a panel docked on the right that you open from the header (and close again; it remembers its width and whether it was open). The audit log (22) is the same event stream written to disk, so build one event system and give it two outputs.
+
+**Events** (`src/activity.ts`: one typed `ActivityEvent` with a time, chat id, who, category, a one-line summary and optional details):
+- **Run:** started, finished (done / stopped / error / step limit / budget), total time.
+- **Model requests:** sent (model, step number, messages and estimated tokens), finished (tokens in/out, cost, time to first token, total time), and API errors with retries.
+- **Tools:** each call with a short argument summary; how permission was decided (automatic / asked and approved / asked and denied / refused by mode or guard); time taken; result status and size; flags for "truncated", "redacted N secrets", "flagged as dangerous".
+- **Approvals:** shown, answered, and how long you took.
+- **Commands:** started, exit code, timed out or cancelled.
+- **Subagents:** started, each of their tool calls (nested under them), finished, cost.
+- **Projects:** opened (read-only / writable), closed, mode changed.
+- **Conversation:** your queued message joined the run, a budget warning, the context passing 70%/90%, a save failure.
+
+**Panel:**
+- Newest at the bottom and follows new events while you're at the bottom; scrolling up pauses following with a "Jump to latest" button.
+- Filter chips (Requests, Tools, Approvals, Subagents, Errors) and a search box. Errors and refusals are coloured.
+- Each row is one line; click to expand for the full arguments, result preview, token counts and timings. Subagent events are indented under their subagent.
+- A running footer: elapsed time, steps, requests, tokens, cost.
+- Copy a row, copy all visible rows, and export as JSON lines. Clear only empties the view, never the saved log.
+- Works for the open chat. Reopening a chat loads its earlier events from the saved log; a chat made before this existed shows an empty log.
+
+**How it plugs in:** `runAgent` gets an `onEvent` callback (like `onUpdate` and `onUsage` today) and the tool registry's `execute` emits tool, permission and result events, so nothing is added tool by tool. `App.tsx` keeps the events for the open chat in memory (capped at 2,000 rows), and appends batches to the audit file through the Rust `audit_append` command. The panel is its own component, so it adds a column to the layout rather than more code in `App.tsx`.
+
+**Nothing secret in it:** every event goes through the redaction stage (19) before it is shown or saved. File contents are never logged, only paths, sizes and a short preview of results. API keys never appear.
+
+**Tests:** event construction for each tool outcome, redaction applied to events, the cap on in-memory rows, filters and search as pure functions, and Rust tests for appending and reading the monthly file.
 
 ### 19. Secret redaction (M, uses 0.3)
 - `src/redact.ts`: patterns for OpenRouter/OpenAI/Anthropic keys (`sk-…`), AWS (`AKIA…`), GitHub (`ghp_…`, `github_pat_…`), Slack, private-key blocks, JWTs, and `KEY=value` lines in `.env*` files where the key name looks secret (`TOKEN`, `SECRET`, `PASSWORD`, `KEY`).

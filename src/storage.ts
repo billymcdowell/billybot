@@ -9,7 +9,7 @@ import { searchableText, snippetAround } from "./history";
 // the others.
 const store = new LazyStore("harness.json");
 
-export type Mode = "ask" | "acceptEdits" | "readOnly" | "bypass";
+export type Mode = "ask" | "acceptEdits" | "plan" | "readOnly" | "bypass";
 
 /** A project the agent has open in a chat. Read-only unless opened as writable. */
 export type OpenProject = { name: string; writable: boolean };
@@ -77,6 +77,21 @@ export async function addAlwaysAllowed(scope: string, tool: string) {
 
 export async function clearAlwaysAllowed(scope: string) {
   await store.delete(`allow:${scope}`);
+}
+
+/** Every project (or workspace) that has tools remembered as "always allow". */
+export async function listAlwaysAllowed(): Promise<{ scope: string; tools: string[] }[]> {
+  const entries = await store.entries<string[]>();
+  return entries
+    .filter(([key, tools]) => key.startsWith("allow:") && Array.isArray(tools) && tools.length > 0)
+    .map(([key, tools]) => ({ scope: key.slice("allow:".length), tools }))
+    .sort((a, b) => a.scope.localeCompare(b.scope));
+}
+
+export async function removeAlwaysAllowed(scope: string, tool: string) {
+  const rest = (await getAlwaysAllowed(scope)).filter((t) => t !== tool);
+  if (rest.length) await store.set(`allow:${scope}`, rest);
+  else await store.delete(`allow:${scope}`);
 }
 
 // ---------- Chats, one file each, saved per workspace ----------

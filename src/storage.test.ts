@@ -8,6 +8,7 @@ vi.mock("@tauri-apps/plugin-store", () => ({
     get = async (k: string) => settings.get(k);
     set = async (k: string, v: unknown) => void settings.set(k, v);
     delete = async (k: string) => void settings.delete(k);
+    entries = async () => [...settings.entries()];
     save = async () => {};
   },
 }));
@@ -31,7 +32,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 import {
-  deleteConversation, listChats, loadChat, saveConversation, searchChats, updateChatMeta, type Conversation,
+  addAlwaysAllowed, deleteConversation, listAlwaysAllowed, listChats, removeAlwaysAllowed, loadChat, saveConversation, searchChats, updateChatMeta, type Conversation,
 } from "./storage";
 
 let n = 0;
@@ -212,5 +213,30 @@ describe("moving chats out of harness.json", () => {
 
   it("does nothing when there is nothing to move", async () => {
     expect(await listChats(ws)).toEqual([]);
+  });
+});
+
+describe("always allowed", () => {
+  it("lists every scope with its tools, and ignores other settings", async () => {
+    settings.set("setting:model", "x");
+    await addAlwaysAllowed("/ws/b", "edit_file");
+    await addAlwaysAllowed("/ws/a", "write_file");
+    await addAlwaysAllowed("/ws/a", "edit_file");
+    await addAlwaysAllowed("/ws/a", "edit_file");
+    expect(await listAlwaysAllowed()).toEqual([
+      { scope: "/ws/a", tools: ["write_file", "edit_file"] },
+      { scope: "/ws/b", tools: ["edit_file"] },
+    ]);
+  });
+
+  it("takes one tool back, and forgets the scope when none are left", async () => {
+    await addAlwaysAllowed("/ws/a", "write_file");
+    await addAlwaysAllowed("/ws/a", "edit_file");
+    await removeAlwaysAllowed("/ws/a", "write_file");
+    expect(await listAlwaysAllowed()).toEqual([{ scope: "/ws/a", tools: ["edit_file"] }]);
+    await removeAlwaysAllowed("/ws/a", "edit_file");
+    expect(await listAlwaysAllowed()).toEqual([]);
+    expect(settings.has("allow:/ws/a")).toBe(false);
+    await removeAlwaysAllowed("/ws/none", "x"); // nothing to remove: fine
   });
 });
