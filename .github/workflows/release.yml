@@ -19,6 +19,12 @@ jobs:
             args: --target aarch64-apple-darwin
           - platform: macos-latest
             args: --target x86_64-apple-darwin
+          # 22.04 on purpose: the AppImage and .deb link against the build machine's
+          # WebKitGTK and glibc, so a newer runner would exclude older distros.
+          - platform: ubuntu-22.04
+            args: ""
+          - platform: windows-latest
+            args: ""
 
     runs-on: ${{ matrix.platform }}
     env:
@@ -27,6 +33,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev patchelf cmake libclang-dev
+
       - uses: actions/setup-node@v4
         with:
           node-version: lts/*
@@ -34,11 +47,21 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          # Both Mac targets are needed because the Mac jobs share one runner type.
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: "./src-tauri -> target"
+
+      # whisper-rs-sys forwards every GGML_* env var to CMake. By default ggml builds with
+      # -march=native, which makes the installer crash with "illegal instruction" on any CPU
+      # older than the CI runner. OFF gives a portable x86-64 baseline (SSE4.2, AVX, AVX2,
+      # FMA, F16C). Must stay unset on macOS: an empty value would also be forwarded.
+      - name: Build whisper.cpp for a portable CPU baseline
+        if: runner.os != 'macOS'
+        run: echo "GGML_NATIVE=OFF" >> "$GITHUB_ENV"
+        shell: bash
 
       - run: npm ci
 

@@ -1,39 +1,89 @@
+mod procgroup;
 mod stt;
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::io::Read;
-use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-// Where the API key lives in macOS Keychain.
+use procgroup::ProcessGroup;
+
+// Where the API key lives in the system credential store: macOS Keychain, Windows Credential
+// Manager, or the Secret Service (GNOME Keyring, KWallet) on Linux. keyring 4's default `v1`
+// feature picks the store for the platform on first use.
 const SERVICE: &str = "billybot";
 const ACCOUNT: &str = "openrouter";
 
-// ---------- API key (macOS Keychain) ----------
+// ---------- API key (system credential store) ----------
+
+/// Turns a keyring error into text for the user. On Linux the usual cause is that no keyring
+/// service is running (a minimal desktop or a headless session), which deserves a real hint.
+fn keyring_error_text(err: &keyring::Error, linux: bool) -> String {
+    use keyring::Error::{NoDefaultStore, NoStorageAccess, PlatformFailure};
+    let detail = match err {
+        NoDefaultStore => match keyring::Entry::store_status() {
+            Err(cause) => cause.to_string(),
+            Ok(()) => err.to_string(),
+        },
+        _ => err.to_string(),
+    };
+    if linux && matches!(err, NoDefaultStore | NoStorageAccess(_) | PlatformFailure(_)) {
+        format!(
+            "Couldn't reach the system keyring, which billybot uses to store your API key. \
+             Install and unlock a Secret Service provider such as GNOME Keyring or KWallet, \
+             then restart billybot. ({detail})"
+        )
+    } else {
+        detail
+    }
+}
+
+fn keyring_error(err: keyring::Error) -> String {
+    keyring_error_text(&err, cfg!(target_os = "linux"))
+}
 
 /// Returns the saved key, or None if you haven't saved one yet.
 #[tauri::command]
 fn get_api_key() -> Result<Option<String>, String> {
-    let entry = keyring::Entry::new(SERVICE, ACCOUNT).map_err(|e| e.to_string())?;
+    let entry = keyring::Entry::new(SERVICE, ACCOUNT).map_err(keyring_error)?;
     match entry.get_password() {
         Ok(key) => Ok(Some(key)),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(keyring_error(e)),
     }
 }
 
-/// Saves (or replaces) the key in Keychain.
+/// Saves (or replaces) the key in the system credential store.
 #[tauri::command]
 fn set_api_key(key: String) -> Result<(), String> {
-    let entry = keyring::Entry::new(SERVICE, ACCOUNT).map_err(|e| e.to_string())?;
-    entry.set_password(key.trim()).map_err(|e| e.to_string())
+    let entry = keyring::Entry::new(SERVICE, ACCOUNT).map_err(keyring_error)?;
+    entry.set_password(key.trim()).map_err(keyring_error)
 }
 
 // ---------- The workspace (outer wall) ----------
+
+/// On Windows `fs::canonicalize` returns `\\?\C:\dir` (or `\\?\UNC\server\share`). That form is
+/// right for comparing paths, but cmd.exe, node and git mishandle it as a working directory,
+/// and it is ugly in the UI. This gives the ordinary spelling when that is equivalent, and
+/// leaves anything else (including paths too long for the ordinary form) alone.
+fn strip_verbatim(path: &str) -> String {
+    const MAX_PLAIN: usize = 259; // MAX_PATH minus the terminator
+    if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        let plain = format!(r"\\{unc}");
+        return if plain.len() <= MAX_PLAIN { plain } else { path.to_string() };
+    }
+    if let Some(rest) = path.strip_prefix(r"\\?\") {
+        let b = rest.as_bytes();
+        let drive = b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\';
+        if drive && rest.len() <= MAX_PLAIN {
+            return rest.to_string();
+        }
+    }
+    path.to_string()
+}
 
 /// Checks a folder is a sensible workspace and returns its real path.
 /// Refuses the whole disk and your whole home folder.
@@ -46,17 +96,23 @@ fn check_workspace(path: String) -> Result<String, String> {
     if ws.parent().is_none() {
         return Err("Choose a folder, not the whole disk".into());
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    // std's home_dir reads $HOME on Unix and the user profile on Windows, where $HOME is unset.
+    if let Some(home) = std::env::home_dir() {
         if fs::canonicalize(home).map(|h| h == ws).unwrap_or(false) {
             return Err("Choose a folder inside your home folder, not the whole home folder".into());
         }
     }
-    Ok(ws.to_string_lossy().to_string())
+    Ok(strip_verbatim(&ws.to_string_lossy()))
 }
 
 /// A project name must be one plain folder name: no slashes, no "..", not hidden.
 fn check_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name.starts_with('.') || name.contains('/') || name.contains('\\') {
+        return Err(format!("\"{name}\" is not a valid project name"));
+    }
+    // On Windows "C:x" is a drive prefix that makes join() discard the workspace, and "x:y" is
+    // an alternate data stream. (project_root's parent check would catch the first anyway.)
+    if cfg!(windows) && name.chars().any(|c| matches!(c, ':' | '<' | '>' | '"' | '|' | '?' | '*') || c.is_control()) {
         return Err(format!("\"{name}\" is not a valid project name"));
     }
     Ok(())
@@ -156,6 +212,11 @@ fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
     let resolved = match fs::canonicalize(&full) {
         Ok(p) => p,
         Err(_) => {
+            // canonicalize also fails for a link whose target is missing, and writing through
+            // such a link would create the target, wherever it points.
+            if fs::symlink_metadata(&full).is_ok() {
+                return Err(format!("Refused: {path} is a link that doesn't lead anywhere"));
+            }
             let parent = full.parent().ok_or("Invalid path")?;
             let name = full.file_name().ok_or("Invalid path")?;
             let parent = fs::canonicalize(parent)
@@ -231,12 +292,82 @@ fn edit_file(
 // reach anything your user account can. The project is only where it starts. The
 // protection is the approval prompt in the app, so keep that in place.
 
-const SHELL: &str = "/bin/zsh";
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 const MAX_TIMEOUT_SECS: u64 = 300;
 const READ_LIMIT: usize = 1_000_000; // bytes kept while a command runs; the rest is thrown away
 const HEAD_CHARS: usize = 10_000;
 const TAIL_CHARS: usize = 20_000;
+
+/// The shell that runs commands, and whether it is started as a login shell (so it reads the
+/// user's profile and gets their real PATH). macOS keeps zsh, the macOS default. Elsewhere the
+/// model writes POSIX syntax, so we prefer bash over $SHELL, which could be fish or nushell.
+#[cfg(unix)]
+fn unix_shell() -> (&'static str, bool) {
+    if cfg!(target_os = "macos") {
+        return ("/bin/zsh", true);
+    }
+    for bash in ["/bin/bash", "/usr/bin/bash"] {
+        if Path::new(bash).exists() {
+            return (bash, true);
+        }
+    }
+    ("/bin/sh", false) // not every sh (e.g. dash) understands -l
+}
+
+#[cfg(unix)]
+fn shell_command(command: &str) -> Command {
+    let (shell, login) = unix_shell();
+    let mut cmd = Command::new(shell);
+    if login {
+        cmd.arg("-l");
+    }
+    cmd.args(["-c", command]);
+    cmd
+}
+
+/// Base64 (standard alphabet, padded). Only used to pass a script to PowerShell.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = (chunk[0] as u32) << 16
+            | (*chunk.get(1).unwrap_or(&0) as u32) << 8
+            | *chunk.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// The script PowerShell runs for a command: UTF-8 output (the default is the OEM code page),
+/// and an exit code that reflects the command. `-Command` alone turns every native exit code
+/// into 1, so we pass the real one on.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_script(command: &str) -> String {
+    format!(
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n\
+         $global:LASTEXITCODE = $null\n\
+         {command}\n\
+         $ok = $?; $code = $LASTEXITCODE\n\
+         if ($code) {{ exit $code }} elseif (-not $ok) {{ exit 1 }} else {{ exit 0 }}\n"
+    )
+}
+
+/// Windows PowerShell 5.1 ships with every Windows. The script goes in as UTF-16 base64
+/// (-EncodedCommand) so quotes in the command survive Windows' command-line parsing.
+#[cfg(windows)]
+fn shell_command(command: &str) -> Command {
+    let utf16: Vec<u8> = powershell_script(command).encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut cmd = Command::new("powershell.exe");
+    cmd.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", &base64(&utf16)]);
+    cmd
+}
 
 /// Keeps the start and the end of long output, which is where errors usually are.
 fn shorten(text: &str) -> String {
@@ -259,16 +390,16 @@ static RUNNING: Mutex<Vec<Arc<AtomicBool>>> = Mutex::new(Vec::new());
 fn run_shell(root: &Path, command: &str, timeout: Duration, cancel: &AtomicBool) -> Result<String, String> {
     // One pipe for both stdout and stderr, so the output keeps its real order.
     let (mut reader, writer) = std::io::pipe().map_err(|e| e.to_string())?;
-    let mut cmd = Command::new(SHELL);
-    cmd.args(["-l", "-c", command])
-        .current_dir(root)
+    let mut cmd = shell_command(command);
+    ProcessGroup::configure(&mut cmd);
+    cmd.current_dir(strip_verbatim(&root.to_string_lossy()))
         .env("NO_COLOR", "1")
         .env("TERM", "dumb")
         .stdin(Stdio::null())
         .stdout(writer.try_clone().map_err(|e| e.to_string())?)
-        .stderr(writer)
-        .process_group(0); // its own group, so we can stop everything it starts
+        .stderr(writer);
     let mut child = cmd.spawn().map_err(|e| format!("Couldn't start the shell: {e}"))?;
+    let group = ProcessGroup::attach(&child);
     drop(cmd); // closes our copies of the pipe's write end, so reading stops when the command does
 
     let collector = std::thread::spawn(move || {
@@ -288,7 +419,6 @@ fn run_shell(root: &Path, command: &str, timeout: Duration, cancel: &AtomicBool)
         (kept, capped)
     });
 
-    let pid = child.id() as i32;
     let start = Instant::now();
     let mut timed_out = false;
     let mut cancelled = false;
@@ -311,9 +441,7 @@ fn run_shell(root: &Path, command: &str, timeout: Duration, cancel: &AtomicBool)
     // Kill whatever is left in the command's group: everything on a timeout, or stray
     // background jobs after a normal exit. Without this, a leftover process would keep
     // the output pipe open and we would wait on it forever.
-    unsafe {
-        libc::killpg(pid, libc::SIGKILL);
-    }
+    group.kill();
     let _ = child.wait();
     let (bytes, capped) = collector.join().map_err(|_| "Couldn't read the command's output")?;
 
@@ -370,9 +498,39 @@ fn cancel_commands() -> usize {
     running.len()
 }
 
+/// Dictation records from the microphone in the webview. WebKitGTK ships with MediaStream off
+/// and denies every permission request nobody handles, so on Linux we turn it on and allow
+/// the microphone (and only the microphone). macOS and Windows keep their own system prompts.
+#[cfg(target_os = "linux")]
+fn allow_microphone_on_linux(
+    builder: tauri::Builder<tauri::Wry>,
+) -> tauri::Builder<tauri::Wry> {
+    use tauri::webview::{PermissionKind, PermissionResponse};
+    use tauri::Manager;
+    builder
+        .on_permission_request(|_, kind| match kind {
+            PermissionKind::Microphone => PermissionResponse::Allow,
+            _ => PermissionResponse::Default,
+        })
+        .setup(|app| {
+            if let Some(window) = app.get_webview_window("main") {
+                window.with_webview(|webview| {
+                    use webkit2gtk::{SettingsExt, WebViewExt};
+                    if let Some(settings) = webview.inner().settings() {
+                        settings.set_enable_media_stream(true);
+                    }
+                })?;
+            }
+            Ok(())
+        })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(target_os = "linux")]
+    let builder = allow_microphone_on_linux(builder);
+    builder
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -456,6 +614,96 @@ mod tests {
         assert_eq!(fs::read_to_string(&outside).unwrap(), "secret");
     }
 
+    #[test]
+    fn edit_cannot_leave_the_project_with_an_absolute_path() {
+        let ws = workspace("absolute");
+        fs::create_dir_all(format!("{ws}/other")).unwrap();
+        let outside = fs::canonicalize(format!("{ws}/other")).unwrap().join("b.txt");
+        fs::write(&outside, "secret").unwrap();
+        // Joining an absolute path replaces the project root, so this must be caught afterwards.
+        let target = outside.to_string_lossy().to_string();
+        assert!(edit(&ws, &target, "secret", "hacked").unwrap_err().contains("outside the project"));
+        assert!(write_file(ws.clone(), "proj".into(), target, "x".into()).is_err());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "secret");
+    }
+
+    #[test]
+    fn a_new_file_cannot_be_created_outside_the_project() {
+        let ws = workspace("new-outside");
+        assert!(write_file(ws.clone(), "proj".into(), "../new.txt".into(), "x".into()).is_err());
+        assert!(write_file(ws.clone(), "proj".into(), "sub/../../new.txt".into(), "x".into()).is_err());
+        assert!(!Path::new(&format!("{ws}/new.txt")).exists());
+    }
+
+    #[test]
+    fn project_names_must_be_one_plain_folder_name() {
+        for bad in ["", ".hidden", "a/b", "a\\b", "..", "../proj"] {
+            assert!(check_name(bad).is_err(), "{bad:?} was accepted");
+        }
+        assert!(check_name("my-app_2").is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_and_stream_names_are_not_project_names() {
+        for bad in ["C:evil", "x:stream", "a|b", "a*"] {
+            assert!(check_name(bad).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn verbatim_prefixes_are_stripped_only_when_equivalent() {
+        assert_eq!(strip_verbatim(r"\\?\C:\Users\me\ws"), r"C:\Users\me\ws");
+        assert_eq!(strip_verbatim(r"\\?\UNC\server\share\ws"), r"\\server\share\ws");
+        // Already plain, not a drive path, or too long for the plain form: unchanged.
+        assert_eq!(strip_verbatim(r"C:\Users\me"), r"C:\Users\me");
+        assert_eq!(strip_verbatim("/Users/me/ws"), "/Users/me/ws");
+        assert_eq!(strip_verbatim(r"\\?\Volume{1234}\x"), r"\\?\Volume{1234}\x");
+        let long = format!(r"\\?\C:\{}", "a".repeat(300));
+        assert_eq!(strip_verbatim(&long), long);
+    }
+
+    #[test]
+    fn workspace_check_returns_a_usable_path_and_refuses_the_home_folder() {
+        let ws = workspace("check-ws");
+        let shown = check_workspace(ws.clone()).unwrap();
+        assert_eq!(fs::canonicalize(&shown).unwrap(), fs::canonicalize(&ws).unwrap());
+        assert!(!shown.starts_with(r"\\?\C:"), "{shown}");
+        let home = std::env::home_dir().expect("a home folder");
+        assert!(check_workspace(home.to_string_lossy().to_string()).unwrap_err().contains("home folder"));
+        assert!(check_workspace(ws + "/missing").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_nowhere_cannot_be_used_to_create_a_file_outside_the_project() {
+        let ws = workspace("dangling");
+        let target = format!("{ws}/created-by-link.txt");
+        std::os::unix::fs::symlink(&target, format!("{ws}/proj/link.txt")).unwrap();
+        let result = write_file(ws.clone(), "proj".into(), "link.txt".into(), "x".into());
+        assert!(result.is_err(), "{result:?}");
+        assert!(!Path::new(&target).exists(), "the file was created through the link");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_project_folder_that_is_a_link_elsewhere_is_refused() {
+        let ws = workspace("linked-project");
+        let outside = workspace("linked-project-outside"); // a different workspace entirely
+        std::os::unix::fs::symlink(format!("{outside}/proj"), format!("{ws}/linked")).unwrap();
+        assert!(project_root(&ws, "linked").is_err());
+    }
+
+    // Shell snippets that mean the same thing in zsh/bash and in PowerShell.
+    fn sleep_cmd(secs: u64) -> String {
+        if cfg!(windows) { format!("Start-Sleep {secs}") } else { format!("sleep {secs}") }
+    }
+
+    /// How long to let a shell start before cancelling it. PowerShell is much slower to start.
+    fn settle_secs() -> u64 {
+        if cfg!(windows) { 8 } else { 2 }
+    }
+
     fn run(ws: &str, command: &str, secs: u64) -> String {
         let root = project_root(ws, "proj").unwrap();
         run_shell(&root, command, Duration::from_secs(secs), &AtomicBool::new(false)).unwrap()
@@ -468,13 +716,14 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = cancel.clone();
         let start = Instant::now();
-        let job = std::thread::spawn(move || run_shell(&root, "echo before; sleep 30", Duration::from_secs(60), &flag));
-        std::thread::sleep(Duration::from_secs(2)); // the login shell takes ~0.5s to start
+        let command = format!("echo before; {}", sleep_cmd(30));
+        let job = std::thread::spawn(move || run_shell(&root, &command, Duration::from_secs(60), &flag));
+        std::thread::sleep(Duration::from_secs(settle_secs())); // a login shell takes ~0.5s to start
         cancel.store(true, Ordering::SeqCst);
         let out = job.join().unwrap().unwrap();
         assert!(out.starts_with("Cancelled"), "{out}");
         assert!(out.contains("before"), "output so far is kept: {out}");
-        assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
+        assert!(start.elapsed() < Duration::from_secs(settle_secs() + 3), "took {:?}", start.elapsed());
     }
 
     #[test]
@@ -483,7 +732,7 @@ mod tests {
         let root = project_root(&ws, "proj").unwrap();
         let cancelled = AtomicBool::new(true);
         let untouched = AtomicBool::new(false);
-        assert!(run_shell(&root, "sleep 30", Duration::from_secs(60), &cancelled).unwrap().starts_with("Cancelled"));
+        assert!(run_shell(&root, &sleep_cmd(30), Duration::from_secs(60), &cancelled).unwrap().starts_with("Cancelled"));
         assert!(run_shell(&root, "echo fine", Duration::from_secs(10), &untouched).unwrap().starts_with("Exit code 0"));
     }
 
@@ -498,7 +747,12 @@ mod tests {
     #[test]
     fn command_reports_failure_and_stderr() {
         let ws = workspace("cmd-fail");
-        let out = run(&ws, "echo oops 1>&2; exit 3", 10);
+        let failing = if cfg!(windows) {
+            "[Console]::Error.WriteLine('oops'); exit 3"
+        } else {
+            "echo oops 1>&2; exit 3"
+        };
+        let out = run(&ws, failing, 20);
         assert!(out.starts_with("Exit code 3"), "{out}");
         assert!(out.contains("oops"));
     }
@@ -506,16 +760,18 @@ mod tests {
     #[test]
     fn command_starts_in_the_project_folder() {
         let ws = workspace("cmd-cwd");
-        let expected = project_root(&ws, "proj").unwrap();
-        let out = run(&ws, "pwd", 10);
-        assert!(out.contains(expected.to_str().unwrap()), "{out}");
+        // The shell is started in the ordinary spelling of the path (no \\?\ prefix on Windows).
+        let expected = strip_verbatim(project_root(&ws, "proj").unwrap().to_str().unwrap());
+        let print_cwd = if cfg!(windows) { "(Get-Location).Path" } else { "pwd" };
+        let out = run(&ws, print_cwd, 20);
+        assert!(out.contains(&expected), "{out}");
     }
 
     #[test]
     fn command_times_out_and_is_killed() {
         let ws = workspace("cmd-timeout");
         let start = Instant::now();
-        let out = run(&ws, "sleep 30", 1);
+        let out = run(&ws, &sleep_cmd(30), 1);
         assert!(out.starts_with("Timed out after 1s"), "{out}");
         assert!(start.elapsed() < Duration::from_secs(10));
     }
@@ -524,7 +780,13 @@ mod tests {
     fn command_cannot_leave_a_background_job_running() {
         let ws = workspace("cmd-bg");
         let start = Instant::now();
-        let out = run(&ws, "sleep 30 & echo started", 10);
+        // The background process inherits the output pipe, so it must be killed for us to finish.
+        let background = if cfg!(windows) {
+            "Start-Process -NoNewWindow -FilePath ping.exe -ArgumentList '-n','30','127.0.0.1'; echo started"
+        } else {
+            "sleep 30 & echo started"
+        };
+        let out = run(&ws, background, 20);
         assert!(out.contains("started"), "{out}");
         // Without the group kill we would sit here until the background sleep ended.
         assert!(start.elapsed() < Duration::from_secs(10));
@@ -534,35 +796,119 @@ mod tests {
     fn command_gets_no_input() {
         let ws = workspace("cmd-stdin");
         let start = Instant::now();
-        let out = run(&ws, "cat", 10); // would wait forever for input if stdin were open
+        // Would wait forever for input if stdin were open.
+        let read_stdin = if cfg!(windows) { "[Console]::In.ReadToEnd() | Out-Null" } else { "cat" };
+        let out = run(&ws, read_stdin, 20);
         assert!(out.starts_with("Exit code 0"), "{out}");
-        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(start.elapsed() < Duration::from_secs(15));
     }
 
     #[test]
     fn command_output_is_shortened() {
         let ws = workspace("cmd-long");
-        let out = run(&ws, "head -c 100000 /dev/zero | tr '\\0' a", 20);
+        let long_line = if cfg!(windows) {
+            "Write-Output ('a' * 100000)"
+        } else {
+            "head -c 100000 /dev/zero | tr '\\0' a"
+        };
+        let out = run(&ws, long_line, 30);
         assert!(out.contains("characters omitted"), "{}", &out[..80.min(out.len())]);
         assert!(out.len() < 35_000);
     }
 
     #[test]
-    fn claude_md_is_read_normally_but_not_through_a_symlink_out_of_the_project() {
-        let ws = workspace("claude-md");
-        let note = format!("{ws}/proj/CLAUDE.md");
+    fn claude_md_is_read_normally() {
+        let ws = workspace("claude-md-plain");
         // A missing file is simply "no instructions".
         assert!(read_file(ws.clone(), "proj".into(), "CLAUDE.md".into()).is_err());
         // A normal file is read.
-        fs::write(&note, "Use tabs.").unwrap();
-        assert_eq!(read_file(ws.clone(), "proj".into(), "CLAUDE.md".into()).unwrap(), "Use tabs.");
+        fs::write(format!("{ws}/proj/CLAUDE.md"), "Use tabs.").unwrap();
+        assert_eq!(read_file(ws, "proj".into(), "CLAUDE.md".into()).unwrap(), "Use tabs.");
+    }
+
+    // Creating symlinks on Windows needs a privilege, so there the same boundary is tested
+    // with directory junctions instead (see the windows_junction tests below).
+    #[cfg(unix)]
+    #[test]
+    fn claude_md_is_not_read_through_a_symlink_out_of_the_project() {
+        let ws = workspace("claude-md");
+        let note = format!("{ws}/proj/CLAUDE.md");
         // A CLAUDE.md that is really a link to a private file elsewhere must not be read, or its
         // contents would be sent to the model.
-        fs::remove_file(&note).unwrap();
         fs::write(format!("{ws}/secret.txt"), "top secret").unwrap();
         std::os::unix::fs::symlink(format!("{ws}/secret.txt"), &note).unwrap();
         let result = read_file(ws, "proj".into(), "CLAUDE.md".into());
         assert!(result.is_err(), "the symlink was followed: {result:?}");
+    }
+
+    #[test]
+    fn keyring_errors_get_a_linux_hint_only_on_linux() {
+        let none = keyring::Error::NoDefaultStore;
+        let on_linux = keyring_error_text(&none, true);
+        assert!(on_linux.contains("Secret Service"), "{on_linux}");
+        assert!(!keyring_error_text(&none, false).contains("Secret Service"));
+        // An ordinary "wrong value" error is never dressed up as a missing keyring.
+        let bad = keyring::Error::Invalid("x".into(), "y".into());
+        assert_eq!(keyring_error_text(&bad, true), bad.to_string());
+    }
+
+    #[test]
+    fn base64_matches_the_standard_test_vectors() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn powershell_script_runs_the_command_verbatim_and_keeps_its_exit_code() {
+        let script = powershell_script("Write-Output \"hi\" # trailing comment");
+        assert!(script.contains("\nWrite-Output \"hi\" # trailing comment\n"), "{script}");
+        // The exit-code logic must come after the command, on its own line.
+        assert!(script.find("trailing comment").unwrap() < script.find("exit $code").unwrap());
+    }
+
+    /// Makes `link` a directory junction to `target` (no special privilege needed, unlike symlinks).
+    #[cfg(windows)]
+    fn junction(link: &str, target: &str) {
+        let status = Command::new("cmd").args(["/C", "mklink", "/J", link, target]).output().unwrap();
+        assert!(status.status.success(), "mklink failed: {status:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_junction_out_of_the_project_is_not_followed() {
+        let ws = workspace("junction");
+        fs::create_dir_all(format!("{ws}/other")).unwrap();
+        fs::write(format!("{ws}/other/secret.txt"), "top secret").unwrap();
+        junction(&format!("{ws}/proj/out"), &format!("{ws}/other"));
+        assert!(read_file(ws.clone(), "proj".into(), "out/secret.txt".into()).is_err());
+        assert!(write_file(ws.clone(), "proj".into(), "out/new.txt".into(), "x".into()).is_err());
+        assert!(!Path::new(&format!("{ws}/other/new.txt")).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_project_junction_to_another_workspace_is_refused() {
+        let ws = workspace("junction-project");
+        let outside = workspace("junction-project-outside");
+        junction(&format!("{ws}/linked"), &format!("{outside}/proj"));
+        assert!(project_root(&ws, "linked").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_that_look_inside_but_are_not_are_refused() {
+        let ws = workspace("win-paths");
+        fs::create_dir_all(format!("{ws}/other")).unwrap();
+        fs::write(format!("{ws}/other/b.txt"), "secret").unwrap();
+        // Backslash traversal, a drive-qualified path, and a rooted path with no drive.
+        let canonical = fs::canonicalize(format!("{ws}/other/b.txt")).unwrap();
+        let rooted = canonical.to_string_lossy().trim_start_matches(r"\\?\").split_once(':').unwrap().1.to_string();
+        for path in [r"..\other\b.txt".to_string(), canonical.to_string_lossy().to_string(), rooted] {
+            assert!(read_file(ws.clone(), "proj".into(), path.clone()).is_err(), "{path} was readable");
+        }
     }
 
     #[test]

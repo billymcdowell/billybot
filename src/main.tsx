@@ -3,7 +3,7 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 import "./index.css";
 
-// Follow the Mac's light/dark setting. shadcn's dark theme switches on the "dark" class.
+// Follow the system's light/dark setting. shadcn's dark theme switches on the "dark" class.
 const dark = window.matchMedia("(prefers-color-scheme: dark)");
 const applyTheme = () => document.documentElement.classList.toggle("dark", dark.matches);
 applyTheme();

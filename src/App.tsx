@@ -80,6 +80,7 @@ import { fetchToolModels } from "./models";
 import MessageList from "./Messages";
 import { polish, startRecording, transcribe, type Recording } from "./dictation";
 import { MODES, type Approval, type ApprovalRequest } from "./permissions";
+import { computerName, isWindows, keyStoreName } from "./platform";
 import {
   clearAlwaysAllowed,
   deleteConversation,
@@ -96,7 +97,7 @@ import {
 type Pending = { req: ApprovalRequest; resolve: (answer: Approval) => void };
 
 const newId = (): string => crypto.randomUUID();
-const baseName = (p: string) => p.split("/").filter(Boolean).pop() ?? p;
+const baseName = (p: string) => p.split(isWindows ? /[\\/]/ : "/").filter(Boolean).pop() ?? p;
 
 /** A centred card, used for the key and workspace screens. */
 function Setup(props: { title: string; description: string; error: string; children: ReactNode; action: ReactNode }) {
@@ -178,7 +179,7 @@ export default function App() {
     [projects, workspace, instructions, messages, streaming, contextWindow],
   );
 
-  // On startup: read the key from Keychain and restore settings.
+  // On startup: read the key from the system credential store and restore settings.
   useEffect(() => {
     invoke<string | null>("get_api_key")
       .then(setApiKey)
@@ -412,7 +413,7 @@ export default function App() {
     return (
       <Setup
         title="Add your OpenRouter key"
-        description="It's saved in macOS Keychain, never in a file."
+        description={`It's saved in ${keyStoreName}, never in a file.`}
         error={error}
         action={
           <Button className="w-full" onClick={saveKey} disabled={!keyInput.trim()}>
@@ -638,7 +639,7 @@ export default function App() {
                       </CodeBlockContent>
                     </CodeBlock>
                     <p className="text-xs text-muted-foreground">
-                      Runs on your Mac as you, starting in {pending.req.where}. The folder lock does not apply to commands:
+                      Runs on your {computerName} as you, starting in {pending.req.where}. The folder lock does not apply to commands:
                       they can reach any file your account can.
                     </p>
                   </ItemFooter>

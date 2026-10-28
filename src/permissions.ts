@@ -10,7 +10,7 @@ export const MODES: { id: Mode; label: string }[] = [
 // Tools that change something. Everything else is always allowed.
 const WRITE_TOOLS = new Set(["write_file", "edit_file", "create_project"]);
 
-// Tools that run commands. A command can do anything your Mac account can, and the folder
+// Tools that run commands. A command can do anything your user account can, and the folder
 // lock doesn't contain it, so these are held to a stricter rule than file edits:
 //  - Auto-accept still asks. Only Bypass runs them without a prompt.
 //  - "Always allow" is never remembered, since that would approve every future command.

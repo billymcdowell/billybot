@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-22.04 matches the release build, so CI catches the same missing libraries.
+        platform: [macos-latest, ubuntu-22.04, windows-latest]
+
+    runs-on: ${{ matrix.platform }}
+    env:
+      # whisper.cpp needs std::filesystem (macOS 10.15+); Tauri's default target is 10.13.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev patchelf cmake libclang-dev
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      # Same portable CPU baseline as the release build (see release.yml for why).
+      - name: Build whisper.cpp for a portable CPU baseline
+        if: runner.os != 'macOS'
+        run: echo "GGML_NATIVE=OFF" >> "$GITHUB_ENV"
+        shell: bash
+
+      - run: npm ci
+
+      # Tauri embeds the built frontend, so this must run before cargo.
+      - run: npm run build
+
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test
+
+      # Proof that GGML_NATIVE=OFF reached CMake: no whisper.cpp target may use -march=native.
+      - name: Check whisper.cpp was not built for the CI machine's CPU
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          files=$(find src-tauri/target/debug/build -path '*whisper-rs-sys-*' -name flags.make)
+          test -n "$files" || { echo "no whisper.cpp flags.make found"; exit 1; }
+          grep -h 'CXX_FLAGS' $files | sort -u
+          if grep -l -- '-march=native' $files; then echo "-march=native is still in use"; exit 1; fi

@@ -16,11 +16,28 @@ export type Recording = {
   stop: () => Promise<Blob>; // stops and returns the audio
 };
 
-/** Starts recording from the microphone. macOS asks for permission the first time. */
+/**
+ * The formats to try, best first. Each webview can record and decode a different set:
+ *  - macOS WebKit records audio/mp4 (AAC) and, on newer versions, webm.
+ *  - Windows WebView2 (Chromium) records webm/opus, which it always decodes. It can also
+ *    record mp4, but decoding AAC needs a Windows media pack that some editions lack.
+ *  - Linux WebKitGTK records whatever its GStreamer plugins provide: usually webm or ogg.
+ */
+function mimeCandidates(): string[] {
+  const chromium = navigator.userAgent.includes("Chrome/");
+  const webm = ["audio/webm;codecs=opus", "audio/webm"];
+  return chromium
+    ? [...webm, "audio/ogg;codecs=opus", "audio/mp4"]
+    : ["audio/mp4", ...webm, "audio/ogg;codecs=opus"];
+}
+
+/** Starts recording from the microphone. The system or webview asks for permission the first time. */
 export async function startRecording(): Promise<Recording> {
+  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+    throw new Error("This system's web view can't record audio, so dictation isn't available. On Linux, install the GStreamer plugins (gst-plugins-good and gst-plugins-bad).");
+  }
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  // Mac WebKit records audio/mp4; fall back to webm elsewhere.
-  const mimeType = ["audio/mp4", "audio/webm"].find((t) => MediaRecorder.isTypeSupported(t));
+  const mimeType = mimeCandidates().find((t) => MediaRecorder.isTypeSupported(t));
   const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
   const chunks: Blob[] = [];
   recorder.ondataavailable = (e) => {
@@ -45,7 +62,9 @@ export async function startRecording(): Promise<Recording> {
 async function toWhisperSamples(audio: Blob): Promise<Float32Array> {
   const ctx = new AudioContext();
   try {
-    const decoded = await ctx.decodeAudioData(await audio.arrayBuffer());
+    const decoded = await ctx.decodeAudioData(await audio.arrayBuffer()).catch((e) => {
+      throw new Error(`Couldn't decode the recording (${audio.type || "unknown format"}): ${e?.message ?? e}`);
+    });
     // Re-render the audio at 16 kHz into one channel (this mixes stereo down to mono).
     const offline = new OfflineAudioContext(1, Math.ceil(decoded.duration * 16000), 16000);
     const source = offline.createBufferSource();
@@ -59,7 +78,7 @@ async function toWhisperSamples(audio: Blob): Promise<Float32Array> {
   }
 }
 
-// ---------- Transcribing (on your Mac) and cleaning up ----------
+// ---------- Transcribing (on this computer) and cleaning up ----------
 
 export async function transcribe(audio: Blob): Promise<string> {
   const samples = await toWhisperSamples(audio);

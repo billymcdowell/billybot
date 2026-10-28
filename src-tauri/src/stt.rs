@@ -12,7 +12,10 @@ const MODEL_FILE: &str = "ggml-base.en.bin";
 #[derive(Default)]
 pub struct Stt(Mutex<Option<Arc<WhisperContext>>>);
 
-/// ~/Library/Application Support/<app identifier>/models/<MODEL_FILE>
+/// <app data dir>/models/<MODEL_FILE>, where the app data dir is
+/// macOS:   ~/Library/Application Support/<app identifier>
+/// Windows: %APPDATA%\<app identifier>
+/// Linux:   ~/.local/share/<app identifier>
 fn model_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     Ok(dir.join("models").join(MODEL_FILE))

@@ -6,6 +6,7 @@ import type {
 } from "openai/resources/chat/completions";
 import { clipInstructions, formatInstructions, INSTRUCTIONS_FILE, type ProjectInstructions } from "./instructions";
 import { checkPermission, type AskFn } from "./permissions";
+import { isWindows } from "./platform";
 import type { Mode, OpenProject, SubagentRun } from "./storage";
 
 export const DEFAULT_MODEL = "anthropic/claude-sonnet-5.5";
@@ -90,11 +91,16 @@ const PROJECT_TOOLS = [
   ),
 ];
 
+// Windows runs commands in PowerShell; macOS and Linux use a POSIX shell.
+const SHELL_NOTE = isWindows
+  ? " Commands run in Windows PowerShell 5.1, not bash: use PowerShell syntax (Get-ChildItem, $env:NAME, `;` to chain) and Windows paths."
+  : "";
+
 // Only the main agent gets this, not subagents.
 const SHELL_TOOLS = [
   fn(
     "run_command",
-    "Run a shell command (tests, a build, installing packages, git) in the folder of an open, writable project. The user must approve every command, so keep each one short and purposeful. It cannot ask questions or take input, and it is stopped after the time limit. Do not use it to read or write files: use the file tools for that.",
+    "Run a shell command (tests, a build, installing packages, git) in the folder of an open, writable project. The user must approve every command, so keep each one short and purposeful. It cannot ask questions or take input, and it is stopped after the time limit. Do not use it to read or write files: use the file tools for that." + SHELL_NOTE,
     {
       project: { type: "string", description: "The open, writable project to run the command in." },
       command: { type: "string" },
@@ -184,7 +190,8 @@ export function systemPrompt(
 
 /** "bakery/src/a.ts" → { project: "bakery", rest: "src/a.ts" } */
 function splitPath(p: string) {
-  const clean = p.replace(/^(\.\/|\/)+/, "");
+  // Models on Windows often write backslashes; Rust accepts "/" there too.
+  const clean = (isWindows ? p.replace(/\\/g, "/") : p).replace(/^(\.\/|\/)+/, "");
   const slash = clean.indexOf("/");
   return slash === -1
     ? { project: clean, rest: "" }
