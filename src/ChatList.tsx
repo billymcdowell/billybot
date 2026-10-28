@@ -38,7 +38,7 @@ type Props = {
 function StatusMark({ summary }: { summary: SessionSummary | undefined }) {
   if (!summary) return null;
   if (summary.needsYou) {
-    return <span className="size-2 shrink-0 rounded-full bg-amber-500" role="img" aria-label="Needs your approval" title="Needs your approval" />;
+    return <span className="size-2 shrink-0 rounded-full bg-amber-500" role="img" aria-label="Waiting for you" title="Waiting for your approval or an answer" />;
   }
   if (summary.phase === "running") return <Spinner className="size-3 shrink-0" aria-label="Working" />;
   if (summary.phase === "waiting") return <ClockIcon className="size-3 shrink-0 text-muted-foreground" aria-label="Waiting for a free slot" />;

@@ -37,6 +37,7 @@ export type ApprovalRequest = {
   danger?: string; // why this call is risky enough to ask even in Bypass mode
   warning?: string; // something to look at before approving, such as a key inside a command
   mode?: Mode; // shown on the card
+  owner?: string; // for a subagent's request: the delegate_task call that started it
 };
 export type AskFn = (req: ApprovalRequest) => Promise<Approval>;
 

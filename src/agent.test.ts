@@ -64,7 +64,7 @@ describe("toolsFor", () => {
   it("gives the main agent every tool, in a stable order", () => {
     expect(names("main")).toEqual([
       "list_projects", "open_project", "close_project", "create_project", "delegate_task",
-      "run_command", "list_dir", "read_file", "write_file", "edit_file", "multi_edit", "grep", "glob",
+      "run_command", "list_dir", "read_file", "write_file", "edit_file", "multi_edit", "grep", "glob", "todo_write", "ask_user",
     ]);
   });
   it("gives subagents only the file and search tools", () => {
@@ -101,7 +101,7 @@ describe("runAgent", () => {
   it("sends the system prompt first and the tool definitions", async () => {
     await run([say("ok")]);
     expect(client.requests[0].messages[0].role).toBe("system");
-    expect(client.requests[0].tools).toHaveLength(13);
+    expect(client.requests[0].tools).toHaveLength(15);
   });
 
   it("runs a tool and sends its result back", async () => {
@@ -789,5 +789,267 @@ describe("before a file change", () => {
     const beforeWrite = vi.fn(async (_p: string) => {});
     await run([useTools(call("create_project", { name: "newapp" })), say("ok")], { beforeWrite });
     expect(beforeWrite).not.toHaveBeenCalled();
+  });
+});
+
+describe("reading in parallel", () => {
+  const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  it("runs neighbouring reads together and still adds their results in the order they were asked for", async () => {
+    let live = 0;
+    let peak = 0;
+    const slow = (ms: number, out: string) => async () => {
+      live++;
+      peak = Math.max(peak, live);
+      await delay(ms);
+      live--;
+      return out;
+    };
+    const timings: Record<string, ReturnType<ReturnType<typeof slow>>> = {};
+    void timings;
+    backend({
+      read_lines: ({ path }) => (path === "a" ? slow(40, "A")() : path === "b" ? slow(5, "B")() : slow(20, "C")()),
+    });
+    const started = Date.now();
+    const out = await run([useTools(call("read_file", { path: "app/a" }, "1"), call("read_file", { path: "app/b" }, "2"), call("read_file", { path: "app/c" }, "3")), say("ok")]);
+    expect(peak).toBe(3);
+    expect(Date.now() - started).toBeLessThan(90); // not 40 + 5 + 20 one after another
+    expect(toolResults(out)).toEqual(["A", "B", "C"]);
+    expect(out.filter((m) => m.role === "tool").map((m) => (m as { tool_call_id: string }).tool_call_id)).toEqual(["1", "2", "3"]);
+  });
+
+  it("treats a write as a barrier: reads before it finish first, reads after it start afterwards", async () => {
+    const log: string[] = [];
+    backend({
+      read_lines: async ({ path }) => { log.push(`start ${path}`); await delay(10); log.push(`end ${path}`); return String(path); },
+      write_file: async () => { log.push("write"); return "Wrote"; },
+      read_file: () => null,
+    });
+    await run([useTools(
+      call("read_file", { path: "app/a" }, "1"), call("read_file", { path: "app/b" }, "2"),
+      call("write_file", { path: "app/w", content: "x" }, "3"),
+      call("read_file", { path: "app/c" }, "4"), call("read_file", { path: "app/d" }, "5"),
+    ), say("ok")]);
+    expect(log.indexOf("write")).toBeGreaterThan(log.indexOf("end a"));
+    expect(log.indexOf("write")).toBeGreaterThan(log.indexOf("end b"));
+    expect(log.indexOf("start c")).toBeGreaterThan(log.indexOf("write"));
+    expect(log.indexOf("start d")).toBeGreaterThan(log.indexOf("write"));
+    expect(log.indexOf("start d")).toBeLessThan(log.indexOf("end c")); // c and d overlap
+  });
+
+  it("one failing read doesn't stop the others", async () => {
+    backend({
+      read_lines: async ({ path }) => { if (path === "bad") throw new Error("no such file"); return `ok ${path}`; },
+    });
+    const out = await run([useTools(call("read_file", { path: "app/a" }, "1"), call("read_file", { path: "app/bad" }, "2"), call("read_file", { path: "app/c" }, "3")), say("ok")]);
+    expect(toolResults(out)).toEqual(["ok a", "Error: no such file", "ok c"]);
+  });
+
+  it("mixes kinds of reads, runs no more than eight at once, and answers every call", async () => {
+    let live = 0;
+    let peak = 0;
+    backend({
+      read_lines: async () => { live++; peak = Math.max(peak, live); await delay(5); live--; return "x"; },
+      grep_files: async () => { live++; peak = Math.max(peak, live); await delay(5); live--; return "g"; },
+      list_dir: async () => ["f"],
+    });
+    const calls = Array.from({ length: 20 }, (_, i) => (i % 3 === 0 ? call("grep", { pattern: "x", path: "app" }, `c${i}`) : i % 3 === 1 ? call("read_file", { path: "app/a" }, `c${i}`) : call("list_dir", { path: "app" }, `c${i}`)));
+    const out = await run([useTools(...calls), say("ok")]);
+    expect(toolResults(out)).toHaveLength(20);
+    expect(peak).toBeLessThanOrEqual(8);
+    expect(peak).toBeGreaterThan(1);
+  });
+
+  it("still asks about a change one at a time", async () => {
+    backend({ write_file: () => "Wrote", read_file: () => null });
+    let asking = 0;
+    let most = 0;
+    const ask = vi.fn(async () => { asking++; most = Math.max(most, asking); await delay(5); asking--; return "once" as const; });
+    await run([useTools(call("write_file", { path: "app/a", content: "1" }, "1"), call("write_file", { path: "app/b", content: "2" }, "2")), say("ok")], { ask }, "ask");
+    expect(ask).toHaveBeenCalledTimes(2);
+    expect(most).toBe(1);
+  });
+
+  it("doesn't start reads after Stop but answers each one", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    backend({ read_lines: () => "x" });
+    const out = await run([useTools(call("read_file", { path: "app/a" }, "1"), call("read_file", { path: "app/b" }, "2")), say("ok")], { signal: controller.signal });
+    expect(toolResults(out)).toEqual(["Cancelled: the user pressed Stop.", "Cancelled: the user pressed Stop."]);
+  });
+});
+
+describe("the to-do list", () => {
+  it("replaces the list each time and tells the model how it stands", async () => {
+    const onTodos = vi.fn();
+    const items = [{ content: "Read the code", status: "completed" }, { content: "Fix the bug", status: "in_progress" }, { content: "Add a test", status: "pending" }];
+    const out = await run([useTools(call("todo_write", { items })), say("ok")], { onTodos });
+    expect(onTodos).toHaveBeenCalledWith(items);
+    expect(toolResults(out)[0]).toBe("Todo list updated: 1 of 3 done. Working on: Fix the bug");
+  });
+
+  it("can clear the list, and says when everything is done", async () => {
+    const onTodos = vi.fn();
+    const cleared = await run([useTools(call("todo_write", { items: [] })), say("ok")], { onTodos });
+    expect(toolResults(cleared)[0]).toBe("Todo list cleared.");
+    const finished = await run([useTools(call("todo_write", { items: [{ content: "a", status: "completed" }] })), say("ok")], { onTodos });
+    expect(toolResults(finished)[0]).toBe("Todo list updated: 1 of 1 done. All done.");
+  });
+
+  it("explains what is wrong with a bad list and changes nothing", async () => {
+    const onTodos = vi.fn();
+    const bad = (items: unknown) => run([useTools(call("todo_write", { items })), say("ok")], { onTodos }).then(toolResults);
+    expect((await bad([{ content: "a", status: "in_progress" }, { content: "b", status: "in_progress" }]))[0]).toMatch(/Only one item can be in_progress/);
+    expect((await bad([{ content: "a", status: "doing" }]))[0]).toMatch(/status "doing"/);
+    expect((await bad([{ content: "  ", status: "pending" }]))[0]).toMatch(/needs some content/);
+    expect((await bad("not a list"))[0]).toMatch(/must be a list/);
+    expect((await bad(Array.from({ length: 31 }, () => ({ content: "x", status: "pending" }))))[0]).toMatch(/At most 30/);
+    expect((await bad([{ content: "x".repeat(201), status: "pending" }]))[0]).toMatch(/longer than 200/);
+    expect(onTodos).not.toHaveBeenCalled();
+  });
+
+  it("is for the main agent only, and is allowed in Plan mode", async () => {
+    const replies = [useTools(call("todo_write", { items: [] })), say("ok")];
+    client = fakeClient([], () => replies.shift()!);
+    const sub = await runAgent(options({ role: "sub", who: "app agent" }));
+    expect(toolResults(sub)).toEqual(["Error: Subagents cannot use todo_write."]);
+    const plan = await run([useTools(call("todo_write", { items: [{ content: "a", status: "pending" }] })), say("ok")], {}, "plan");
+    expect(toolResults(plan)[0]).toMatch(/^Todo list updated/);
+  });
+});
+
+describe("asking the user", () => {
+  it("waits for the answer and passes it back", async () => {
+    const askUser = vi.fn(async () => "Use Postgres");
+    const out = await run([useTools(call("ask_user", { question: "Which database?", options: ["Postgres", "SQLite"] })), say("ok")], { askUser });
+    expect(askUser).toHaveBeenCalledWith({ question: "Which database?", options: ["Postgres", "SQLite"] });
+    expect(toolResults(out)[0]).toBe("The user answered: Use Postgres");
+  });
+
+  it("tells the model when the run was stopped before an answer, and when there is no one to ask", async () => {
+    const stopped = await run([useTools(call("ask_user", { question: "Sure?" })), say("ok")], { askUser: async () => null });
+    expect(toolResults(stopped)[0]).toBe("The user didn't answer (the run was stopped).");
+    const nobody = await run([useTools(call("ask_user", { question: "Sure?" })), say("ok")]);
+    expect(toolResults(nobody)[0]).toMatch(/can't be asked right now/);
+  });
+
+  it("checks the question and the options", async () => {
+    const askUser = vi.fn(async () => "x");
+    const attempt = (args: object) => run([useTools(call("ask_user", args)), say("ok")], { askUser }).then(toolResults);
+    expect((await attempt({ question: "  " }))[0]).toMatch(/must not be empty/);
+    expect((await attempt({ question: "x".repeat(601) }))[0]).toMatch(/under 600/);
+    expect((await attempt({ question: "q", options: "a, b" }))[0]).toMatch(/options must be a list/);
+    expect((await attempt({ question: "q", options: ["a", ""] }))[0]).toMatch(/options must be a list/);
+    expect((await attempt({ question: "q", options: ["x".repeat(121)] }))[0]).toMatch(/options must be a list/);
+    expect(askUser).not.toHaveBeenCalled();
+    await attempt({ question: " q ", options: [" a ", "b", "c", "d", "e", "f", "g", "h"] });
+    expect(askUser).toHaveBeenCalledWith({ question: "q", options: ["a", "b", "c", "d", "e", "f"] });
+  });
+
+  it("is asked one at a time even when the model asks several together, alongside reads", async () => {
+    backend({ read_lines: () => "text" });
+    let waiting = 0;
+    let most = 0;
+    const askUser = vi.fn(async (q: { question: string }) => {
+      waiting++;
+      most = Math.max(most, waiting);
+      await new Promise((r) => setTimeout(r, 5));
+      waiting--;
+      return `a to ${q.question}`;
+    });
+    const out = await run([useTools(call("read_file", { path: "app/a" }, "r"), call("ask_user", { question: "one" }, "q1"), call("ask_user", { question: "two" }, "q2")), say("ok")], { askUser });
+    expect(most).toBe(1);
+    expect(toolResults(out)).toEqual(["text", "The user answered: a to one", "The user answered: a to two"]);
+  });
+
+  it("is for the main agent only, and works in Plan mode", async () => {
+    const replies = [useTools(call("ask_user", { question: "q" })), say("ok")];
+    client = fakeClient([], () => replies.shift()!);
+    const sub = await runAgent(options({ role: "sub", who: "app agent", askUser: async () => "x" }));
+    expect(toolResults(sub)).toEqual(["Error: Subagents cannot use ask_user."]);
+    const plan = await run([useTools(call("ask_user", { question: "q" })), say("ok")], { askUser: async () => "yes" }, "plan");
+    expect(toolResults(plan)[0]).toBe("The user answered: yes");
+  });
+
+  it("hides secrets in the answer from the model like anything else", async () => {
+    const out = await run([useTools(call("ask_user", { question: "key?" })), say("ok")], { askUser: async () => "it is sk-or-v1-0123456789abcdef0123456789abcdef" });
+    expect(toolResults(out)[0]).not.toContain("0123456789abcdef");
+  });
+});
+
+describe("telling the model about the list and questions", () => {
+  it("is in the main agent's instructions and not the subagent's", () => {
+    const main = systemPrompt({ role: "main", workspace: "/ws", projects: [] });
+    expect(main).toContain("todo_write");
+    expect(main).toContain("ask_user");
+    const sub = systemPrompt({ role: "sub", workspace: "/ws", projects: [{ name: "app", writable: true }] });
+    expect(sub).not.toContain("todo_write");
+  });
+});
+
+describe("stopping one subagent", () => {
+  it("ends only that subagent: the main agent carries on and is told what happened", async () => {
+    backend({ check_project: () => undefined });
+    const stops = new Map<string, () => void>();
+    const registerSubagent = vi.fn((id: string, stop: (() => void) | null) => void (stop ? stops.set(id, stop) : stops.delete(id)));
+    const onSubagent = vi.fn();
+    const mainSignal = new AbortController();
+    // the subagent asks the model for a reply; while it is "thinking", the user stops just that subagent
+    const out = await run(
+      [useTools(call("delegate_task", { project: "app", task: "do it" }, "d1")), say("carrying on without it")],
+      { registerSubagent, onSubagent, signal: mainSignal.signal },
+      "bypass",
+      () => { stops.get("d1")!(); return say("half a thought"); },
+    );
+    expect(registerSubagent).toHaveBeenCalledWith("d1", expect.any(Function));
+    expect(registerSubagent).toHaveBeenLastCalledWith("d1", null);
+    expect(mainSignal.signal.aborted).toBe(false);
+    expect(last(onSubagent.mock.calls)[1]).toMatchObject({ status: "stopped" });
+    expect(toolResults(out)[0]).toBe("Report from the app agent:\nStopped by the user before it finished. What it had said so far: half a thought");
+    expect(last(out)).toEqual({ role: "assistant", content: "carrying on without it" });
+  });
+
+  it("pressing Stop for the whole run stops its subagents too, and cleans up", async () => {
+    backend({ check_project: () => undefined });
+    const registerSubagent = vi.fn();
+    const onSubagent = vi.fn();
+    const controller = new AbortController();
+    await run(
+      [useTools(call("delegate_task", { project: "app", task: "t" })), say("ok")],
+      { registerSubagent, onSubagent, signal: controller.signal },
+      "bypass",
+      () => { controller.abort(); return say("partial"); },
+    );
+    expect(last(onSubagent.mock.calls)[1].status).toBe("stopped");
+    expect(registerSubagent).toHaveBeenLastCalledWith(expect.any(String), null);
+  });
+
+  it("records when it started and ended, and what it was saying as it went", async () => {
+    backend({ check_project: () => undefined });
+    const onSubagent = vi.fn();
+    await run([useTools(call("delegate_task", { project: "app", task: "t" }, "d1")), say("ok")], { onSubagent }, "bypass", () => say("done"));
+    const states = onSubagent.mock.calls.map((c) => c[1]);
+    expect(states[0]).toMatchObject({ status: "running", startedAt: expect.any(Number) });
+    const final = last(states);
+    expect(final).toMatchObject({ status: "done", report: "done", streaming: "" });
+    expect(final.endedAt).toBeGreaterThanOrEqual(final.startedAt);
+  });
+
+  it("tags its usage and its approval requests with the subagent that made them", async () => {
+    backend({ check_project: () => undefined, write_file: () => "Wrote", read_file: () => null });
+    const onUsage = vi.fn();
+    const { ask, asked } = recordingAsk("once");
+    const replies: Reply[] = [{ ...useTools(call("write_file", { path: "app/a", content: "x" })), usage: { prompt: 5, completion: 1, cost: 0.002 } }, say("done")];
+    await run([useTools(call("delegate_task", { project: "app", task: "t" }, "d1")), say("ok")], { onUsage, ask }, "ask", () => replies.shift()!);
+    expect(onUsage.mock.calls.map((c) => c[0]).find((u) => u.role === "sub")).toMatchObject({ callId: "d1", cost: 0.002 });
+    expect(onUsage.mock.calls.map((c) => c[0]).find((u) => u.role === "main")?.callId).toBeUndefined();
+    expect(asked[0]).toMatchObject({ tool: "write_file", owner: "d1", who: "app agent" });
+  });
+
+  it("the main agent's own approvals have no owner", async () => {
+    backend({ write_file: () => "Wrote", read_file: () => null });
+    const { ask, asked } = recordingAsk("once");
+    await run([useTools(call("write_file", { path: "app/a", content: "x" })), say("ok")], { ask }, "ask");
+    expect(asked[0].owner).toBeUndefined();
   });
 });

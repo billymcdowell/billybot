@@ -19,6 +19,7 @@ import {
 import type { Limits } from "./limits";
 import type { ModelInfo } from "./models";
 import { MODES, type Approval, type ApprovalRequest } from "./permissions";
+import type { Todo } from "./todos";
 import type { Conversation, Mode, OpenProject, SubagentRun } from "./storage";
 import type { AgentOptions } from "./tools/types";
 
@@ -41,6 +42,9 @@ export type Queued = { id: string; text: string; steering?: boolean };
 /** An approval the agent is waiting on. */
 export type Pending = { id: string; req: ApprovalRequest; resolve: (answer: Approval) => void };
 
+/** A question from the agent (ask_user), waiting for your answer. */
+export type Question = { id: string; question: string; options: string[]; resolve: (answer: string | null) => void };
+
 /** waiting = lined up for a free slot (too many chats are working); running = an agent is working. */
 export type Phase = "idle" | "waiting" | "running";
 
@@ -58,6 +62,8 @@ export type Session = {
   runs: CheckpointRun[];
   changed: Record<string, number>; // files each turn changed, which can be undone
   approvals: Pending[];
+  questions: Question[];
+  todos: Todo[]; // the agent's to-do list
   phase: Phase;
   stopped: boolean; // the last run ended because Stop was pressed
   closedMidRun: boolean; // the app was closed while this chat was working
@@ -87,12 +93,32 @@ export const titleOf = (s: Pick<Session, "meta" | "messages">) =>
 export function blankSession(id: string, mode: Mode, now: number): Session {
   return {
     id, meta: {}, messages: [], projects: [], subagents: {}, streaming: "", usage: emptyUsage(), lastUsage: null, events: [],
-    queue: [], runs: [], changed: {}, approvals: [], phase: "idle", stopped: false, closedMidRun: false, error: "", notice: "",
+    queue: [], runs: [], changed: {}, approvals: [], questions: [], todos: [], phase: "idle", stopped: false, closedMidRun: false, error: "", notice: "",
     mode, draft: "", attention: null, touched: now, updatedAt: now,
   };
 }
 
 export const isBusy = (s: Pick<Session, "phase"> | undefined) => !!s && s.phase !== "idle";
+
+// A subagent's transcript is kept so you can read it later, but its tool results (whole files, long
+// command output) would make every save huge, so the saved copy keeps only the start of each.
+const SAVED_RESULT_CHARS = 2000;
+export function trimSubagents(runs: Record<string, SubagentRun>): Record<string, SubagentRun> {
+  return Object.fromEntries(
+    Object.entries(runs).map(([id, run]) => [
+      id,
+      {
+        ...run,
+        streaming: undefined,
+        messages: run.messages.map((m) =>
+          m.role === "tool" && typeof m.content === "string" && m.content.length > SAVED_RESULT_CHARS
+            ? { ...m, content: `${m.content.slice(0, SAVED_RESULT_CHARS)}\n[... ${(m.content.length - SAVED_RESULT_CHARS).toLocaleString("en-US")} more characters not kept ...]` }
+            : m,
+        ),
+      },
+    ]),
+  );
+}
 
 /** Everything a saved chat holds. */
 export function toConversation(s: Session, updatedAt: number): Conversation {
@@ -104,13 +130,14 @@ export function toConversation(s: Session, updatedAt: number): Conversation {
     updatedAt,
     messages: s.messages,
     projects: s.projects,
-    subagents: s.subagents,
+    subagents: trimSubagents(s.subagents),
     stopped: s.stopped,
     usage: s.usage,
     budgetExtra: s.meta.budgetExtra,
     forkedFrom: s.meta.forkedFrom,
     checkpoints: s.runs,
     mode: s.mode,
+    todos: s.todos,
   };
 }
 
@@ -156,7 +183,7 @@ export class SessionStore {
   private changed(id: string) {
     const s = this.map.get(id);
     const before = this.summaries.get(id);
-    const next: SessionSummary | undefined = s ? { phase: s.phase, needsYou: s.approvals.length > 0, attention: s.attention } : undefined;
+    const next: SessionSummary | undefined = s ? { phase: s.phase, needsYou: s.approvals.length > 0 || s.questions.length > 0, attention: s.attention } : undefined;
     const same = before && next && before.phase === next.phase && before.needsYou === next.needsYou && before.attention === next.attention;
     if (!same && (before || next)) {
       const copy = new Map(this.summaries);
@@ -219,6 +246,7 @@ export class SessionController {
   private loadedActivity = new Set<string>();
   private warned = new Map<string, { context: Set<number>; budget: boolean }>();
   private branched = new Set<string>(); // "chat:project" pairs handled already
+  private subagentStops = new Map<string, Map<string, () => void>>(); // chat → subagent call → how to stop it
   displayed: string | null = null;
 
   constructor(
@@ -257,6 +285,7 @@ export class SessionController {
       stopped: c.stopped === true,
       closedMidRun: fixed.repaired || subs.repaired,
       mode: c.mode ?? this.deps.defaultMode(),
+      todos: c.todos ?? [],
       updatedAt: c.updatedAt,
     };
     this.store.put(s);
@@ -294,7 +323,7 @@ export class SessionController {
 
   runningIds = () => this.store.all().filter((s) => s.phase !== "idle").map((s) => s.id);
   anyRunning = () => this.store.all().some((s) => s.phase !== "idle");
-  needingYou = () => this.store.all().filter((s) => s.approvals.length > 0).map((s) => s.id);
+  needingYou = () => this.store.all().filter((s) => s.approvals.length > 0 || s.questions.length > 0).map((s) => s.id);
 
   // ----- small changes to a session -----
 
@@ -346,6 +375,7 @@ export class SessionController {
     this.store.delete(id);
     this.loadedActivity.delete(id);
     this.warned.delete(id);
+    this.subagentStops.delete(id);
     return true;
   }
 
@@ -431,7 +461,18 @@ export class SessionController {
     if (waiting !== -1) this.slotQueue.splice(waiting, 1)[0].grant(false);
     const s = this.store.get(id);
     s?.approvals.forEach((p) => p.resolve("deny")); // unblocks anything waiting on you
-    this.store.update(id, { approvals: [] });
+    s?.questions.forEach((q) => q.resolve(null));
+    this.store.update(id, { approvals: [], questions: [] });
+  }
+
+  /** Stops one subagent and leaves the rest of the run going. Anything of its that was waiting on you is declined. */
+  stopSubagent(id: string, callId: string) {
+    this.subagentStops.get(id)?.get(callId)?.();
+    const s = this.store.get(id);
+    if (!s) return;
+    const mine = s.approvals.filter((p) => p.req.owner === callId);
+    mine.forEach((p) => p.resolve("deny"));
+    if (mine.length) this.store.update(id, { approvals: s.approvals.filter((p) => p.req.owner !== callId) });
   }
 
   stopAll() {
@@ -457,6 +498,31 @@ export class SessionController {
     if (!s || !first) return;
     this.store.update(id, { approvals: s.approvals.slice(1) });
     first.resolve(answer);
+  }
+
+  // ----- questions from the agent -----
+
+  /** The agent in `id` calls this and waits for your answer. Null means the run was stopped first. */
+  private askUser(id: string) {
+    return (q: { question: string; options: string[] }) =>
+      new Promise<string | null>((resolve) => {
+        const question: Question = { id: this.deps.newId(), question: q.question, options: q.options, resolve };
+        this.store.update(id, (s) => ({ questions: [...s.questions, question] }));
+        const s = this.store.get(id);
+        this.deps.notify("Has a question for you", `${s ? titleOf(s) : "A chat"}: ${q.question}`);
+      });
+  }
+
+  answerQuestion(id: string, answer: string) {
+    const s = this.store.get(id);
+    const first = s?.questions[0];
+    if (!s || !first) return;
+    this.store.update(id, { questions: s.questions.slice(1) });
+    first.resolve(answer.trim());
+  }
+
+  clearTodos(id: string) {
+    if (!isBusy(this.store.get(id))) this.store.update(id, { todos: [] });
   }
 
   // ----- queued messages -----
@@ -762,6 +828,14 @@ export class SessionController {
         beforeWrite: (project) => this.prepareBranch(id, project),
         messages: history,
         ask: this.ask(id),
+        askUser: this.askUser(id),
+        onTodos: (items) => this.store.update(id, { todos: items }),
+        registerSubagent: (callId, stop) => {
+          const stops = this.subagentStops.get(id) ?? new Map<string, () => void>();
+          if (stop) stops.set(callId, stop);
+          else stops.delete(callId);
+          this.subagentStops.set(id, stops);
+        },
         signal: controller.signal,
         onUpdate: (msgs, partial) => {
           this.store.update(id, { messages: [...msgs], streaming: partial });
@@ -776,7 +850,13 @@ export class SessionController {
           let total!: ChatUsage;
           this.store.update(id, (s) => {
             total = addUsage(s.usage, u, price, turn);
-            return { usage: total, ...(u.role === "main" ? { lastUsage: { promptTokens: u.promptTokens, completionTokens: u.completionTokens } } : {}) };
+            const sub = u.callId ? s.subagents[u.callId] : undefined;
+            const spent = typeof u.cost === "number" ? u.cost : price && price.inputPerM >= 0 && price.outputPerM >= 0 ? (u.promptTokens * price.inputPerM + u.completionTokens * price.outputPerM) / 1_000_000 : 0;
+            return {
+              usage: total,
+              ...(u.role === "main" ? { lastUsage: { promptTokens: u.promptTokens, completionTokens: u.completionTokens } } : {}),
+              ...(sub && u.callId ? { subagents: { ...s.subagents, [u.callId]: { ...sub, cost: (sub.cost ?? 0) + spent } } } : {}),
+            };
           });
           // Say once when the conversation or the budget is getting full.
           const warned = this.warned.get(id)!;
@@ -816,13 +896,14 @@ export class SessionController {
       if (timer) clearTimeout(timer);
       this.saveTimers.delete(id);
       this.active.delete(id);
+      this.subagentStops.delete(id);
       this.release();
       const wasStopped = controller.signal.aborted;
       const watching = this.displayed === id;
       const ending = runState(this.store.get(id)?.messages ?? []);
       // A message sent "now" that the run finished before reading goes back to waiting its turn.
       this.store.update(id, (s) => ({
-        streaming: "", phase: "idle", approvals: [], stopped: wasStopped, touched: this.deps.now(), updatedAt: this.deps.now(),
+        streaming: "", phase: "idle", approvals: [], questions: [], stopped: wasStopped, touched: this.deps.now(), updatedAt: this.deps.now(),
         queue: s.queue.map((q) => (q.steering ? { ...q, steering: false } : q)),
         attention: watching || wasStopped ? null : failure ? "failed" : "done",
       }));

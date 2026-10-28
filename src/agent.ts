@@ -13,6 +13,7 @@ import type { OpenProject, SubagentRun } from "./storage";
 import { textOf } from "./text";
 import { MAX_OPEN_PROJECTS } from "./tools/access";
 import { getTool, toolsFor } from "./tools";
+import { groupCalls, mapLimit } from "./tools/parallel";
 import { processResult, stagesFor, type ResultInfo } from "./tools/pipeline";
 import type { AgentOptions } from "./tools/types";
 
@@ -22,6 +23,7 @@ export type { AgentOptions };
 export const DEFAULT_MODEL = "anthropic/claude-sonnet-5.5";
 // Model for subagents. Empty = same as the main agent. A cheaper model saves money.
 export const SUBAGENT_MODEL = "";
+const MAX_PARALLEL_TOOLS = 8; // read-only calls run together, this many at a time
 const MAX_STEPS = 25; // per agent, so a confused model can't loop forever
 
 export { textOf };
@@ -74,6 +76,8 @@ export function systemPrompt(
     "When a task starts, call list_projects to find the right project and open it. Create a project only if nothing fits.",
     `Open projects read-only unless you need to change them. At most ${MAX_OPEN_PROJECTS} can be open; close ones you no longer need.`,
     "For larger jobs spanning projects, use delegate_task to give each project its own subagent, and include any shared contract in each task.",
+    "For work with three or more steps, keep a to-do list with todo_write: write the whole list first, keep one item in_progress, and mark items completed as you go. Skip it for simple requests.",
+    "If you need a decision only the user can make, or a detail you can't find by looking, use ask_user with short options rather than guessing. Don't ask what you can find out yourself.",
     ...(o.getMode?.() === "plan"
       ? [
           "PLAN MODE is on. You cannot change anything: edits and commands are refused. Explore with the read-only tools (list_projects, list_dir, read_file, grep, glob), then reply with a concrete plan: the files you would change and how, the order of the steps, risks, and how to check it worked. Do not try to make the changes. The user will review the plan and approve it before you can act.",
@@ -141,7 +145,7 @@ async function execute(
       return answer;
     };
     const refusal = await checkPermission(
-      { tool: tool.name, category: tool.category, args: args as Record<string, unknown>, who, where, before, mode, ...risk },
+      { tool: tool.name, category: tool.category, args: args as Record<string, unknown>, who, where, before, mode, owner: o.subagentCallId, ...risk },
       mode,
       scope,
       ask,
@@ -196,34 +200,56 @@ async function runSubagent(callId: string, project: string, task: string, o: Age
   if (o.role === "sub") throw new Error("Subagents cannot delegate.");
   await invoke("check_project", { workspace: o.workspace, name: project });
 
-  const run: SubagentRun = { project, task, status: "running", messages: [{ role: "user", content: task }] };
+  const run: SubagentRun = { project, task, status: "running", messages: [{ role: "user", content: task }], startedAt: Date.now() };
   const report = () => o.onSubagent?.(callId, { ...run, messages: [...run.messages] });
   report();
   const began = performance.now();
   const ref = `subagent-${callId}`;
   o.onEvent?.({ category: "subagent", ref, pending: true, who: o.who ?? "Main agent", summary: `Subagent for ${project}: ${task.replace(/\s+/g, " ").slice(0, 80)}`, detail: { project, taskChars: task.length } });
 
+  // The subagent has its own Stop, so you can end one without ending the whole run. The run's Stop ends it too.
+  const own = new AbortController();
+  const stopWithRun = () => own.abort();
+  if (o.signal?.aborted) own.abort();
+  else o.signal?.addEventListener("abort", stopWithRun, { once: true });
+  o.registerSubagent?.(callId, () => own.abort());
+
   try {
     run.messages = await runAgent({
-      ...o, // same key, workspace, mode, approvals and Stop signal
+      ...o, // same key, workspace, mode and approvals
+      signal: own.signal,
       model: SUBAGENT_MODEL || o.model,
       role: "sub",
       who: `${project} agent`,
+      subagentCallId: callId,
       projects: [{ name: project, writable: true }],
       onProjectsChange: undefined,
       onSubagent: undefined,
+      onTodos: undefined,
+      askUser: undefined,
+      registerSubagent: undefined,
       messages: run.messages,
-      onUpdate: (msgs) => {
+      onUpdate: (msgs, partial) => {
         run.messages = msgs;
+        run.streaming = partial;
         report();
       },
     });
-    run.report = textOf(run.messages[run.messages.length - 1]?.content) || "(no report)";
-    run.status = o.signal?.aborted ? "stopped" : "done"; // Stop makes the loop return rather than throw
+    const said = textOf(run.messages[run.messages.length - 1]?.content);
+    run.status = own.signal.aborted ? "stopped" : "done"; // Stop makes the loop return rather than throw
+    run.report =
+      run.status === "stopped"
+        ? `Stopped by the user before it finished.${said ? ` What it had said so far: ${said}` : " It had not reported anything yet."}`
+        : said || "(no report)";
   } catch (e) {
-    run.status = o.signal?.aborted ? "stopped" : "failed";
+    run.status = own.signal.aborted ? "stopped" : "failed";
     run.report = `Subagent ${run.status}: ${e instanceof Error ? e.message : String(e)}`;
+  } finally {
+    o.signal?.removeEventListener("abort", stopWithRun);
+    o.registerSubagent?.(callId, null);
   }
+  run.streaming = "";
+  run.endedAt = Date.now();
   report();
   o.onEvent?.({
     category: "subagent", ref, who: o.who ?? "Main agent",
@@ -299,6 +325,7 @@ export async function runAgent(o: AgentOptions): Promise<ChatCompletionMessagePa
             promptTokens: chunk.usage.prompt_tokens,
             completionTokens: chunk.usage.completion_tokens,
             cost: (chunk.usage as { cost?: number }).cost,
+            callId: o.subagentCallId,
           });
         }
         const delta = chunk.choices[0]?.delta;
@@ -355,19 +382,29 @@ export async function runAgent(o: AgentOptions): Promise<ChatCompletionMessagePa
     });
     o.onUpdate(messages, "");
 
-    // 3. Run the tools. Ordinary tools run one after another, in order;
-    //    delegate_task calls start immediately and run side by side.
+    // 3. Run the tools. Neighbouring read-only calls (listing, reading, searching) run side by side;
+    //    anything else runs alone and in order, so a write is a barrier between two reads.
+    //    delegate_task calls start at once and run side by side with everything.
+    //    Results are added in the order the model called them.
     const addResult = (id: string, content: string) => {
       messages.push({ role: "tool", tool_call_id: id, content });
       o.onUpdate(messages, "");
     };
     const subagents: Promise<void>[] = [];
     let slot = 0;
-    for (const call of toolCalls) {
-      if (call.name === "delegate_task") {
-        subagents.push(execute(call, o, slot++).then((r) => addResult(call.id, r)));
-      } else {
-        addResult(call.id, await execute(call, o, 0));
+    const canRunTogether = (c: { name: string }) => c.name !== "delegate_task" && getTool(c.name)?.parallelSafe === true;
+    for (const group of groupCalls(toolCalls, canRunTogether)) {
+      if (group.parallel && group.calls.length > 1) {
+        const results = await mapLimit(group.calls, MAX_PARALLEL_TOOLS, (c) => execute(c, o, 0));
+        group.calls.forEach((c, i) => addResult(c.id, results[i]));
+        continue;
+      }
+      for (const call of group.calls) {
+        if (call.name === "delegate_task") {
+          subagents.push(execute(call, o, slot++).then((r) => addResult(call.id, r)));
+        } else {
+          addResult(call.id, await execute(call, o, 0));
+        }
       }
     }
     await Promise.all(subagents);

@@ -908,3 +908,191 @@ describe("helpers", () => {
     expect(store.getSummaries().get("A")!.phase).toBe("running");
   });
 });
+
+describe("questions from the agent", () => {
+  it("waits for your answer in that chat only, marks the chat as needing you, and passes the answer back", async () => {
+    const { ctl, store, agent, notified } = setup();
+    ctl.create("A");
+    ctl.create("B");
+    ctl.send("A", "build it");
+    ctl.send("B", "other");
+    await flush();
+    const got = vi.fn();
+    void agent.calls[0].opts.askUser!({ question: "Postgres or SQLite?", options: ["Postgres", "SQLite"] }).then(got);
+    await flush();
+    expect(store.get("A")!.questions.map((q) => q.question)).toEqual(["Postgres or SQLite?"]);
+    expect(store.get("B")!.questions).toEqual([]);
+    expect(ctl.needingYou()).toEqual(["A"]);
+    expect(store.getSummaries().get("A")!.needsYou).toBe(true);
+    expect(lastOf(notified)).toEqual(["Has a question for you", "build it: Postgres or SQLite?"]);
+
+    ctl.answerQuestion("B", "ignored"); // nothing to answer in B
+    expect(got).not.toHaveBeenCalled();
+    ctl.answerQuestion("A", "  SQLite  ");
+    await flush();
+    expect(got).toHaveBeenCalledWith("SQLite");
+    expect(store.get("A")!.questions).toEqual([]);
+    expect(ctl.needingYou()).toEqual([]);
+  });
+
+  it("answers several questions in the order they were asked", async () => {
+    const { ctl, agent } = setup();
+    ctl.create("A");
+    ctl.send("A", "go");
+    await flush();
+    const order: string[] = [];
+    void agent.calls[0].opts.askUser!({ question: "one", options: [] }).then((a) => order.push(`one=${a}`));
+    void agent.calls[0].opts.askUser!({ question: "two", options: [] }).then((a) => order.push(`two=${a}`));
+    ctl.answerQuestion("A", "x");
+    ctl.answerQuestion("A", "y");
+    await flush();
+    expect(order).toEqual(["one=x", "two=y"]);
+  });
+
+  it("Stop gives the agent a 'no answer' and clears the question", async () => {
+    const { ctl, store, agent } = setup();
+    ctl.create("A");
+    ctl.send("A", "go");
+    await flush();
+    const got = vi.fn();
+    void agent.calls[0].opts.askUser!({ question: "sure?", options: [] }).then(got);
+    ctl.stop("A");
+    await flush();
+    expect(got).toHaveBeenCalledWith(null);
+    expect(store.get("A")!.questions).toEqual([]);
+  });
+
+  it("needs-you counts a question the same as an approval", async () => {
+    const { ctl, store, agent } = setup();
+    ctl.create("A");
+    ctl.create("B");
+    ctl.send("A", "a");
+    ctl.send("B", "b");
+    await flush();
+    void agent.calls[0].opts.askUser!({ question: "q", options: [] });
+    void agent.calls[1].opts.ask({ tool: "write_file", category: "write", args: {}, who: "w", where: "app" });
+    await flush();
+    expect(ctl.needingYou().sort()).toEqual(["A", "B"]);
+    expect([...store.getSummaries()].filter(([, v]) => v.needsYou)).toHaveLength(2);
+  });
+});
+
+describe("the to-do list", () => {
+  const items = [{ content: "Read", status: "completed" as const }, { content: "Fix", status: "in_progress" as const }];
+
+  it("belongs to the chat, shows live, and is saved and restored", async () => {
+    const { ctl, store, agent, saved } = setup();
+    ctl.create("A");
+    ctl.create("B");
+    ctl.send("A", "go");
+    await flush();
+    agent.calls[0].opts.onTodos!(items);
+    expect(store.get("A")!.todos).toEqual(items);
+    expect(store.get("B")!.todos).toEqual([]);
+    agent.calls[0].finish();
+    await flush();
+    expect(lastOf(chatsSaved(saved, "A")).todos).toEqual(items);
+    const { ctl: other } = setup();
+    expect(other.ensure(lastOf(chatsSaved(saved, "A"))).todos).toEqual(items);
+  });
+
+  it("stays across messages, and can be cleared when the agent is not working", async () => {
+    const { ctl, store, agent } = setup();
+    ctl.create("A");
+    ctl.send("A", "go");
+    await flush();
+    agent.calls[0].opts.onTodos!(items);
+    ctl.clearTodos("A"); // working: refused
+    expect(store.get("A")!.todos).toHaveLength(2);
+    agent.calls[0].finish();
+    await flush();
+    ctl.send("A", "next");
+    await flush();
+    expect(store.get("A")!.todos).toHaveLength(2);
+    agent.calls[1].finish();
+    await flush();
+    ctl.clearTodos("A");
+    expect(store.get("A")!.todos).toEqual([]);
+  });
+});
+
+describe("subagents inside a chat", () => {
+  const sub = (over: object = {}) => ({ project: "app", task: "t", status: "running" as const, messages: [], ...over });
+
+  it("stopping one declines only its approvals and calls its own stop", async () => {
+    const { ctl, store, agent } = setup();
+    ctl.create("A");
+    ctl.send("A", "go");
+    await flush();
+    const stop1 = vi.fn();
+    const stop2 = vi.fn();
+    agent.calls[0].opts.registerSubagent!("d1", stop1);
+    agent.calls[0].opts.registerSubagent!("d2", stop2);
+    const answers: string[] = [];
+    const req = (owner: string | undefined) => ({ tool: "write_file", category: "write" as const, args: {}, who: "w", where: "app", owner });
+    void agent.calls[0].opts.ask(req("d1")).then((a) => answers.push(`d1:${a}`));
+    void agent.calls[0].opts.ask(req("d2")).then((a) => answers.push(`d2:${a}`));
+    void agent.calls[0].opts.ask(req(undefined)).then((a) => answers.push(`main:${a}`));
+    await flush();
+    ctl.stopSubagent("A", "d1");
+    await flush();
+    expect(stop1).toHaveBeenCalledOnce();
+    expect(stop2).not.toHaveBeenCalled();
+    expect(answers).toEqual(["d1:deny"]);
+    expect(store.get("A")!.approvals.map((p) => p.req.owner)).toEqual(["d2", undefined]);
+    expect(store.get("A")!.phase).toBe("running");
+  });
+
+  it("forgets a subagent's stop when it ends or the run does", async () => {
+    const { ctl, agent } = setup();
+    ctl.create("A");
+    ctl.send("A", "go");
+    await flush();
+    const stop = vi.fn();
+    agent.calls[0].opts.registerSubagent!("d1", stop);
+    agent.calls[0].opts.registerSubagent!("d1", null);
+    ctl.stopSubagent("A", "d1");
+    expect(stop).not.toHaveBeenCalled();
+    agent.calls[0].opts.registerSubagent!("d2", stop);
+    agent.calls[0].finish();
+    await flush();
+    ctl.stopSubagent("A", "d2");
+    expect(stop).not.toHaveBeenCalled();
+  });
+
+  it("adds a subagent's spending to its own record as well as the chat's", async () => {
+    const { ctl, store, agent } = setup();
+    ctl.create("A");
+    ctl.send("A", "go");
+    await flush();
+    agent.calls[0].opts.onSubagent!("d1", sub());
+    const use = (callId: string | undefined, cost: number) =>
+      agent.calls[0].opts.onUsage!({ model: "m", role: callId ? "sub" : "main", who: "w", promptTokens: 1, completionTokens: 1, cost, callId });
+    use("d1", 0.25);
+    use("d1", 0.5);
+    use(undefined, 1);
+    expect(store.get("A")!.subagents.d1.cost).toBeCloseTo(0.75);
+    expect(store.get("A")!.usage.cost).toBeCloseTo(1.75);
+  });
+
+  it("keeps a subagent's transcript when saving, but cuts long tool results", async () => {
+    const { ctl, agent, saved, store } = setup();
+    ctl.create("A");
+    ctl.send("A", "go");
+    await flush();
+    const big = "x".repeat(5000);
+    agent.calls[0].opts.onSubagent!("d1", sub({
+      status: "done", streaming: "typing",
+      messages: [user("task"), { role: "tool", tool_call_id: "c", content: big }, { role: "tool", tool_call_id: "c2", content: "short" }],
+    }));
+    agent.calls[0].finish();
+    await flush();
+    const savedSub = lastOf(chatsSaved(saved, "A")).subagents.d1;
+    const results = savedSub.messages.filter((m) => m.role === "tool").map((m) => String(m.content));
+    expect(results[0].length).toBeLessThan(2100);
+    expect(results[0]).toContain("3,000 more characters not kept");
+    expect(results[1]).toBe("short");
+    expect(savedSub.streaming).toBeUndefined();
+    expect(String(store.get("A")!.subagents.d1.messages[1].content)).toBe(big); // what's on screen is whole
+  });
+});

@@ -1,6 +1,7 @@
 import type { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/chat/completions";
 import type { ActivityDraft } from "../activity";
 import type { UsageEvent } from "../cost";
+import type { Todo } from "../todos";
 import type { Limits } from "../limits";
 import type { AskFn, ToolCategory } from "../permissions";
 import type { Mode, OpenProject, SubagentRun } from "../storage";
@@ -33,6 +34,14 @@ export type AgentOptions = {
   checkpoint?: { chatId: string; runId: string };
   // Called before a file change in a project goes ahead (after any approval). The app uses it to put a chat on its own git branch. A failure never blocks the change.
   beforeWrite?: (project: string) => Promise<void>;
+  // The agent's to-do list changed.
+  onTodos?: (items: Todo[]) => void;
+  // Asks the user a question and waits. Returns their answer, or null if the run was stopped first.
+  askUser?: (q: { question: string; options: string[] }) => Promise<string | null>;
+  // Set on a subagent: the delegate_task call that started it, so its cost and approvals can be told apart.
+  subagentCallId?: string;
+  // A subagent registers a way to stop just itself (null when it ends).
+  registerSubagent?: (callId: string, stop: (() => void) | null) => void;
   redact?: boolean; // hide secrets from the model (default true)
   limits?: Partial<Limits>; // see src/limits.ts; missing values use the defaults
   role?: AgentRole;

@@ -1,6 +1,7 @@
-import type { ElementType } from "react";
+import { useEffect, useState, type ElementType } from "react";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import {
+  AsteriskIcon,
   BotIcon,
   FilePenIcon,
   FileTextIcon,
@@ -9,6 +10,7 @@ import {
   FolderTreeIcon,
   FolderXIcon,
   GitForkIcon,
+  SquareIcon,
   Undo2Icon,
   ListIcon,
   PencilIcon,
@@ -41,6 +43,7 @@ import {
 } from "@/components/ui/trace";
 import { textOf } from "./agent";
 import Markdown from "./Markdown";
+import { formatDuration } from "./activity";
 import { formatCost } from "./cost";
 import type { SubagentRun } from "./storage";
 
@@ -126,46 +129,94 @@ function ToolLine({ call, result }: { call: Call; result?: string }) {
   );
 }
 
-/** Every tool call in a conversation, as Trace lines. */
-function ToolCalls({ messages }: { messages: Msg[] }) {
+/** The time now, updated every second while `active`, so a running subagent's clock moves. */
+function useNow(active: boolean) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (!active) return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [active]);
+  return now;
+}
+
+/** What a subagent has said and done so far: its words and tool calls in order, then what it is saying right now. */
+function Transcript({ messages, streaming }: { messages: Msg[]; streaming?: string }) {
   const results = resultsOf(messages);
-  const calls = messages.flatMap(callsOf);
-  if (calls.length === 0) return null;
   return (
-    <Trace>
-      {calls.map((c) => (
-        <ToolLine key={c.id} call={c} result={results.get(c.id)} />
-      ))}
-    </Trace>
+    <div className="flex flex-col gap-2">
+      {messages.map((m, i) => {
+        if (m.role !== "assistant") return null;
+        const calls = callsOf(m);
+        return (
+          <div key={i} className="flex flex-col gap-2">
+            {textOf(m.content) && <Markdown>{textOf(m.content)}</Markdown>}
+            {calls.length > 0 && (
+              <Trace>
+                {calls.map((c) => (
+                  <ToolLine key={c.id} call={c} result={results.get(c.id)} />
+                ))}
+              </Trace>
+            )}
+          </div>
+        );
+      })}
+      {streaming && <Markdown>{streaming}</Markdown>}
+    </div>
   );
 }
 
-/** The Subagent pattern: one line for the run; open it for the task, its tool calls and its report. */
-function SubagentLine({ run }: { run: SubagentRun }) {
-  const count = run.messages.flatMap(callsOf).length;
-  const title =
-    run.status === "running"
-      ? `Running the ${run.project} agent`
-      : run.status === "done"
-        ? `Ran the ${run.project} agent`
-        : `The ${run.project} agent ${run.status}`;
+/**
+ * The Subagent pattern: a line for the run that shows how it is going (time, tool calls, cost);
+ * open it to watch the transcript, live while it works. While it runs there is a Stop for just this agent.
+ */
+function SubagentLine({ run, waiting, onStop }: { run: SubagentRun; waiting: boolean; onStop?: () => void }) {
+  const calls = run.messages.flatMap(callsOf).length;
+  const running = run.status === "running";
+  const now = useNow(running);
+  const elapsed = run.startedAt ? (run.endedAt ?? now) - run.startedAt : undefined;
+  const title = running
+    ? `${waiting ? "Waiting for you in" : "Working in"} ${run.project}`
+    : run.status === "done"
+      ? `Finished in ${run.project}`
+      : `The ${run.project} agent ${run.status}`;
+  const facts = [
+    elapsed !== undefined ? formatDuration(elapsed) : "",
+    `${calls} tool ${calls === 1 ? "call" : "calls"}`,
+    run.cost ? formatCost(run.cost) : "",
+  ].filter(Boolean);
   return (
-    <TraceCollapsible>
-      <TraceCollapsibleTrigger>
-        <TraceLine status={run.status === "running" ? "running" : run.status === "done" ? undefined : "error"}>
-          <TraceIcon>
-            <BotIcon />
-          </TraceIcon>
-          <TraceTitle>{title}</TraceTitle>
-          <TraceDescription>{count} tool calls</TraceDescription>
-        </TraceLine>
-      </TraceCollapsibleTrigger>
-      <TraceCollapsibleContent className="flex flex-col gap-3">
-        <p className="text-muted-foreground">{run.task}</p>
-        <ToolCalls messages={run.messages} />
-        {run.report && <Markdown>{run.report}</Markdown>}
-      </TraceCollapsibleContent>
-    </TraceCollapsible>
+    <div className="flex flex-col gap-1">
+      <TraceCollapsible>
+        <TraceCollapsibleTrigger>
+          <TraceLine status={running ? "running" : run.status === "done" ? undefined : "error"}>
+            <TraceIcon>
+              <BotIcon />
+            </TraceIcon>
+            <TraceTitle>{title}</TraceTitle>
+            <TraceDescription>{facts.join(" · ")}</TraceDescription>
+          </TraceLine>
+        </TraceCollapsibleTrigger>
+        <TraceCollapsibleContent className="flex flex-col gap-3">
+          <p className="text-muted-foreground">{run.task}</p>
+          <Transcript messages={run.messages.slice(1)} streaming={run.streaming} />
+          {run.report && (
+            <div className="border-l-2 pl-3">
+              <p className="text-xs text-muted-foreground">Report</p>
+              <Markdown>{run.report}</Markdown>
+            </div>
+          )}
+        </TraceCollapsibleContent>
+      </TraceCollapsible>
+      {running && onStop && (
+        <div className="pl-6">
+          <Button size="xs" variant="outline" onClick={onStop} title="Stop this agent only. The rest of the run carries on.">
+            <SquareIcon /> Stop this agent
+          </Button>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -178,6 +229,8 @@ type Props = {
   turnCosts?: Record<string, number>; // dollars per turn, keyed by the index of the turn's user message
   changedTurns?: Record<string, number>; // files each turn changed, which can be undone
   onRevert?: (turn: number) => void;
+  onStopSubagent?: (callId: string) => void;
+  waitingSubagents?: Set<string>; // subagents with something waiting on you
   busy?: boolean; // hides the per-message actions while the agent works
   onFork?: (index: number) => void;
   onEdit?: (index: number) => void;
@@ -199,6 +252,8 @@ export default function MessageList({
   turnCosts = {},
   changedTurns = {},
   onRevert,
+  onStopSubagent,
+  waitingSubagents,
   busy = false,
   onFork,
   onEdit,
@@ -286,7 +341,12 @@ export default function MessageList({
                         <Trace>
                           {calls.map((c) =>
                             subagents[c.id] ? (
-                              <SubagentLine key={c.id} run={subagents[c.id]} />
+                              <SubagentLine
+                                key={c.id}
+                                run={subagents[c.id]}
+                                waiting={waitingSubagents?.has(c.id) ?? false}
+                                onStop={onStopSubagent ? () => onStopSubagent(c.id) : undefined}
+                              />
                             ) : (
                               <ToolLine key={c.id} call={c} result={results.get(c.id)} />
                             ),
@@ -326,6 +386,18 @@ export default function MessageList({
                 <Message>
                   <MessageContent>
                     <Markdown>{streaming}</Markdown>
+                  </MessageContent>
+                </Message>
+              </MessageScrollerItem>
+            )}
+            {busy && !streaming && (
+              <MessageScrollerItem messageId="working">
+                <Message>
+                  <MessageContent>
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground" role="status" aria-label="Working">
+                      <AsteriskIcon className="size-5 animate-spin text-orange-400" strokeWidth={2.5} />
+                      Working…
+                    </div>
                   </MessageContent>
                 </Message>
               </MessageScrollerItem>

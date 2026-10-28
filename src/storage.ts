@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { LazyStore } from "@tauri-apps/plugin-store";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import type { ChatUsage } from "./cost";
+import type { Todo } from "./todos";
 import { searchableText, snippetAround } from "./history";
 
 // Small settings, and the "always allow" list, live in one JSON file in the app's data folder.
@@ -21,6 +22,10 @@ export type SubagentRun = {
   status: "running" | "done" | "failed" | "stopped";
   messages: ChatCompletionMessageParam[];
   report?: string;
+  streaming?: string; // what it is saying right now
+  startedAt?: number;
+  endedAt?: number;
+  cost?: number; // dollars this subagent has spent
 };
 
 export const CHAT_VERSION = 2;
@@ -41,6 +46,7 @@ export type Conversation = {
   forkedFrom?: { chatId: string; messageIndex: number }; // set on a chat made with "Fork from here"
   checkpoints?: { run: string; turn: number }[]; // each run that may have changed files, and the turn it answered
   mode?: Mode; // this chat's permission mode; chats saved before modes were per chat have none
+  todos?: Todo[]; // the agent's to-do list
 };
 
 /** What the sidebar needs about a chat, kept in an index so listing never opens every chat. */

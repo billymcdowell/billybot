@@ -8,6 +8,7 @@ export type UsageEvent = {
   promptTokens: number;
   completionTokens: number;
   cost?: number; // US dollars, as reported by OpenRouter
+  callId?: string; // for a subagent: the delegate_task call that started it
 };
 
 export type ChatUsage = {

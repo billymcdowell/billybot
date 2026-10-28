@@ -6,6 +6,7 @@ import {
   AlertCircleIcon,
   ActivityIcon,
   ArrowUpIcon,
+  AsteriskIcon,
   GitBranchIcon,
   ChevronDownIcon,
   EyeIcon,
@@ -45,23 +46,9 @@ import {
   DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
 import { Input } from "@/components/ui/input";
-import {
-  InputGroup,
-  InputGroupAddon,
-  InputGroupButton,
-  InputGroupTextarea,
-} from "@/components/ui/input-group";
-import {
-  Item,
-  ItemActions,
-  ItemContent,
-  ItemDescription,
-  ItemFooter,
-  ItemMedia,
-  ItemTitle,
-} from "@/components/ui/item";
+import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupTextarea } from "@/components/ui/input-group";
+import { Item, ItemActions, ItemContent, ItemDescription, ItemFooter, ItemMedia, ItemTitle } from "@/components/ui/item";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import {
@@ -86,10 +73,7 @@ import { type ActivityEvent } from "./activity";
 import { flushActivity, loadChatActivity, saveActivity } from "./auditLog";
 import ChangesDialog from "./ChangesDialog";
 import ChatList from "./ChatList";
-import {
-  checkpointStatus, describePlan, filesFrom, previewRevert, revertRuns, runsFrom,
-  type PlanSummary,
-} from "./checkpoints";
+import { checkpointStatus, describePlan, filesFrom, previewRevert, revertRuns, runsFrom, type PlanSummary } from "./checkpoints";
 import CostChip, { budgetStep } from "./CostChip";
 import ContextMeter from "./ContextMeter";
 import { contextBreakdown } from "./context";
@@ -104,7 +88,9 @@ import ModelPicker from "./ModelPicker";
 import LimitsPopover from "./LimitsPopover";
 import { DEFAULT_LIMITS, resolveLimits, type Limits } from "./limits";
 import MultiEditDiff from "./MultiEditDiff";
+import QuestionCard from "./QuestionCard";
 import ThemeToggle from "./ThemeToggle";
+import TodoList from "./TodoList";
 import { fetchToolModels, type ModelInfo } from "./models";
 import MessageList, { type EditingMessage } from "./Messages";
 import { polish, startRecording, transcribe, type Recording } from "./dictation";
@@ -125,7 +111,6 @@ import {
   type Mode,
 } from "./storage";
 
-
 const STATE_NOTE: Record<RunState, string> = {
   none: "",
   done: "",
@@ -134,7 +119,15 @@ const STATE_NOTE: Record<RunState, string> = {
   budget: "This chat reached its budget.",
   unfinished: "This run didn't finish.",
 };
-const baseName = (p: string) => p.split(isWindows ? /[\\/]/ : "/").filter(Boolean).pop() ?? p;
+const greeting = () => {
+  const h = new Date().getHours();
+  return h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening";
+};
+const baseName = (p: string) =>
+  p
+    .split(isWindows ? /[\\/]/ : "/")
+    .filter(Boolean)
+    .pop() ?? p;
 
 /** A centred card, used for the key and workspace screens. */
 function Setup(props: { title: string; description: string; error: string; children: ReactNode; action: ReactNode }) {
@@ -181,7 +174,10 @@ const live = {
   },
 };
 const models: { current: ModelInfo[] } = { current: [] };
-const actions = { refreshChats: () => {}, refreshGit: (_names?: string[]) => {} };
+const actions = {
+  refreshChats: () => {},
+  refreshGit: (_names?: string[]) => {},
+};
 
 const ctl = createController({
   workspace: () => live.current.workspace,
@@ -230,7 +226,10 @@ export default function App() {
   const [editChoice, setEditChoice] = useState<EditingMessage | null>(null); // asks: fork or replace?
   const [fullOutput, setFullOutput] = useState(false); // exports: keep whole tool results
   const [permissionsOpen, setPermissionsOpen] = useState(false);
-  const [revertPlan, setRevertPlan] = useState<{ runIds: string[]; summary: PlanSummary } | null>(null);
+  const [revertPlan, setRevertPlan] = useState<{
+    runIds: string[];
+    summary: PlanSummary;
+  } | null>(null);
   const [regenChoice, setRegenChoice] = useState<number | null>(null); // index of the message being answered again
   const [undoDiscarded, setUndoDiscarded] = useState(true); // the checkbox on the regenerate and edit dialogs
   const [gitInfo, setGitInfo] = useState<Record<string, GitInfo>>({}); // by project name
@@ -244,17 +243,30 @@ export default function App() {
   // The chat on screen, and a short summary of every chat for the sidebar.
   const s = useSession(ctl.store, chatId) ?? blankSession(chatId, defaultMode, 0);
   const summaries = useSummaries(ctl.store);
-  const { messages, projects, subagents, streaming, usage, events, queue, approvals, notice, stopped, closedMidRun, lastUsage, changed } = s;
+  const { messages, projects, subagents, streaming, usage, events, queue, approvals, notice, stopped, closedMidRun, lastUsage, changed } =
+    s;
   const error = s.error;
   const busy = isBusy(s);
+  const isEmpty = messages.length === 0 && !streaming;
   const state = runState(messages, stopped);
   const cap = effectiveCap(limits.budgetUsd, s.meta.budgetExtra); // this chat's spending limit; 0 = none
   const pending = approvals[0];
+  const asked = s.questions[0];
+  const waitingSubagents = new Set(approvals.flatMap((p) => (p.req.owner ? [p.req.owner] : [])));
 
   const waitingOnYou = [...summaries].filter(([, v]) => v.needsYou).map(([id]) => id);
   const workingCount = [...summaries].filter(([, v]) => v.phase !== "idle").length;
 
-  live.current = { apiKey: apiKey ?? null, workspace: workspace ?? null, model, limits, redact: redactOn, branchPerChat, defaultMode, notifyOn };
+  live.current = {
+    apiKey: apiKey ?? null,
+    workspace: workspace ?? null,
+    model,
+    limits,
+    redact: redactOn,
+    branchPerChat,
+    defaultMode,
+    notifyOn,
+  };
 
   /** Looks at each open project's git state for the badges in the header. */
   async function refreshGit(names: string[] = projects.map((p) => p.name)) {
@@ -304,7 +316,11 @@ export default function App() {
   const breakdown = useMemo(
     () =>
       contextBreakdown({
-        systemText: systemPrompt({ role: "main", projects, workspace: workspace ?? "" }),
+        systemText: systemPrompt({
+          role: "main",
+          projects,
+          workspace: workspace ?? "",
+        }),
         toolsText: JSON.stringify(toolsFor("main")),
         instructionsText: formatInstructions(instructions),
         messages,
@@ -356,7 +372,10 @@ export default function App() {
   // Clear out old undo copies once the limits are known.
   useEffect(() => {
     if (!workspace || !limitsReady) return;
-    invoke("checkpoint_prune", { maxAgeDays: limits.checkpointDays, maxMegabytes: limits.checkpointMb }).catch(() => {});
+    invoke("checkpoint_prune", {
+      maxAgeDays: limits.checkpointDays,
+      maxMegabytes: limits.checkpointMb,
+    }).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspace, limitsReady]);
 
@@ -377,7 +396,12 @@ export default function App() {
           if (n === 0) return;
           const ok = await confirm(
             `${n === 1 ? "A chat is" : `${n} chats are`} still working. If you quit now, ${n === 1 ? "it" : "they"} will stop where ${n === 1 ? "it is" : "they are"}. You can pick ${n === 1 ? "it" : "them"} up again with Continue.`,
-            { title: "Quit billybot?", kind: "warning", okLabel: "Quit", cancelLabel: "Keep working" },
+            {
+              title: "Quit billybot?",
+              kind: "warning",
+              okLabel: "Quit",
+              cancelLabel: "Keep working",
+            },
           );
           if (!ok) event.preventDefault();
           else ctl.stopAll();
@@ -435,15 +459,24 @@ export default function App() {
   }
 
   async function pickWorkspace() {
-    const picked = await open({ directory: true, title: "Choose your workspace folder" });
+    const picked = await open({
+      directory: true,
+      title: "Choose your workspace folder",
+    });
     if (typeof picked !== "string") return;
     try {
       const ws = await invoke<string>("check_workspace", { path: picked });
       if (ctl.anyRunning()) {
         const n = ctl.runningIds().length;
-        const ok = await confirm(`${n === 1 ? "A chat is" : `${n} chats are`} working in this workspace. Switching stops ${n === 1 ? "it" : "them"}.`, {
-          title: "Switch workspace?", kind: "warning", okLabel: "Stop and switch", cancelLabel: "Stay",
-        });
+        const ok = await confirm(
+          `${n === 1 ? "A chat is" : `${n} chats are`} working in this workspace. Switching stops ${n === 1 ? "it" : "them"}.`,
+          {
+            title: "Switch workspace?",
+            kind: "warning",
+            okLabel: "Stop and switch",
+            cancelLabel: "Stay",
+          },
+        );
         if (!ok) return;
       }
       ctl.reset();
@@ -536,7 +569,11 @@ export default function App() {
     if (waiting === 0) return;
     const clear =
       waiting === 1 ||
-      (await confirm(`Also discard the ${waiting} messages waiting in the queue?`, { title: "Stop", okLabel: "Discard", cancelLabel: "Keep them" }));
+      (await confirm(`Also discard the ${waiting} messages waiting in the queue?`, {
+        title: "Stop",
+        okLabel: "Discard",
+        cancelLabel: "Keep them",
+      }));
     if (clear) ctl.clearQueue(chatId);
     else ctl.keepQueue(chatId);
   }
@@ -559,7 +596,10 @@ export default function App() {
     if (busy) return;
     const runIds = runsFrom(s.runs, turn, true);
     try {
-      setRevertPlan({ runIds, summary: describePlan(await previewRevert(chatId, runIds)) });
+      setRevertPlan({
+        runIds,
+        summary: describePlan(await previewRevert(chatId, runIds)),
+      });
     } catch (e) {
       ctl.setError(chatId, `Undo: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -638,9 +678,15 @@ export default function App() {
 
   async function exportActivity(visible: ActivityEvent[]) {
     try {
-      const path = await save({ defaultPath: exportFileName(`${titleOf(s)} activity`, "json"), filters: [{ name: "JSON", extensions: ["json"] }] });
+      const path = await save({
+        defaultPath: exportFileName(`${titleOf(s)} activity`, "json"),
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
       if (!path) return;
-      await invoke("write_export", { path, contents: JSON.stringify(visible, null, 2) });
+      await invoke("write_export", {
+        path,
+        contents: JSON.stringify(visible, null, 2),
+      });
       ctl.setNotice(chatId, `Saved ${baseName(path)}.`);
     } catch (e) {
       ctl.setError(chatId, `Export: ${e instanceof Error ? e.message : String(e)}`);
@@ -731,6 +777,8 @@ export default function App() {
       <SidebarProvider>
         <Sidebar>
           <SidebarHeader>
+            {/* Clears the traffic lights and doubles as a window drag handle */}
+            <div data-tauri-drag-region className="h-8" />
             <SidebarMenu>
               <SidebarMenuItem>
                 <SidebarMenuButton onClick={pickWorkspace} tooltip={workspace}>
@@ -751,9 +799,7 @@ export default function App() {
                     className="text-amber-700 dark:text-amber-400"
                   >
                     <ShieldCheckIcon />
-                    <span>
-                      {waitingOnYou.length === 1 ? "1 chat needs you" : `${waitingOnYou.length} chats need you`}
-                    </span>
+                    <span>{waitingOnYou.length === 1 ? "1 chat needs you" : `${waitingOnYou.length} chats need you`}</span>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
               )}
@@ -900,16 +946,14 @@ export default function App() {
             </div>
           </header>
 
-          <div className="min-h-0 flex-1">
-            {messages.length === 0 && !streaming ? (
-              <Empty className="h-full">
-                <EmptyHeader>
-                  <EmptyTitle>What are we working on?</EmptyTitle>
-                  <EmptyDescription>
-                    Describe a task. The agent finds or creates the right project in {baseName(workspace)}.
-                  </EmptyDescription>
-                </EmptyHeader>
-              </Empty>
+          <div className={isEmpty ? "min-h-0 flex-[1.2]" : "min-h-0 flex-1"}>
+            {isEmpty ? (
+              <div className="flex h-full items-end justify-center px-4 pb-4">
+                <h1 className="flex items-center gap-3 font-serif text-4xl">
+                  <AsteriskIcon className="size-8 text-orange-400" strokeWidth={2.5} />
+                  {greeting()}, Billy
+                </h1>
+              </div>
             ) : (
               <MessageList
                 messages={messages}
@@ -918,6 +962,8 @@ export default function App() {
                 turnCosts={usage.turns}
                 changedTurns={changed}
                 onRevert={startRevert}
+                onStopSubagent={(callId) => ctl.stopSubagent(chatId, callId)}
+                waitingSubagents={waitingSubagents}
                 busy={busy}
                 onFork={forkChat}
                 onEdit={(index) => setEditing({ index, text: textOf(messages[index]?.content) })}
@@ -932,7 +978,8 @@ export default function App() {
           <div className="mx-auto flex w-full max-w-3xl flex-col gap-3 p-4">
             {s.phase === "waiting" && (
               <p className="text-sm text-muted-foreground">
-                Waiting for a free slot: {workingCount - 1} other {workingCount - 1 === 1 ? "chat is" : "chats are"} working, and the limit is {limits.maxConcurrentRuns}. Change it in Limits.
+                Waiting for a free slot: {workingCount - 1} other {workingCount - 1 === 1 ? "chat is" : "chats are"} working, and the limit
+                is {limits.maxConcurrentRuns}. Change it in Limits.
               </p>
             )}
             {!busy && state !== "none" && (
@@ -960,7 +1007,11 @@ export default function App() {
                   )
                 )}
                 {s.mode === "plan" && state === "done" && (
-                  <Button size="sm" onClick={() => ctl.approvePlan(chatId)} title="Switch to Auto-accept edits and tell the agent to go ahead">
+                  <Button
+                    size="sm"
+                    onClick={() => ctl.approvePlan(chatId)}
+                    title="Switch to Auto-accept edits and tell the agent to go ahead"
+                  >
                     <PlayIcon />
                     Approve plan
                   </Button>
@@ -1022,6 +1073,10 @@ export default function App() {
             )}
 
             {/* The Confirmation pattern: approve or deny before a change runs */}
+            <TodoList items={s.todos} canClear={!busy} onClear={() => ctl.clearTodos(chatId)} />
+
+            {asked && <QuestionCard question={asked} waiting={s.questions.length - 1} onAnswer={(a) => ctl.answerQuestion(chatId, a)} />}
+
             {pending && (
               <Item variant="outline" size="sm">
                 <ItemMedia variant="icon">
@@ -1093,8 +1148,8 @@ export default function App() {
                       </p>
                     )}
                     <p className="text-xs text-muted-foreground">
-                      Runs on your {computerName} as you, starting in {pending.req.where}. The folder lock does not apply to commands:
-                      they can reach any file your account can.
+                      Runs on your {computerName} as you, starting in {pending.req.where}. The folder lock does not apply to commands: they
+                      can reach any file your account can.
                     </p>
                   </ItemFooter>
                 )}
@@ -1105,10 +1160,7 @@ export default function App() {
                 )}
                 {pending.req.tool === "edit_file" && (
                   <ItemFooter>
-                    <DiffView
-                      before={String(pending.req.args.old_text ?? "")}
-                      after={String(pending.req.args.new_text ?? "")}
-                    />
+                    <DiffView before={String(pending.req.args.old_text ?? "")} after={String(pending.req.args.new_text ?? "")} />
                   </ItemFooter>
                 )}
               </Item>
@@ -1121,12 +1173,10 @@ export default function App() {
                 send();
               }}
             >
-              <InputGroup>
+              <InputGroup className="rounded-2xl">
                 <InputGroupTextarea
                   value={s.draft}
-                  placeholder={
-                    busy ? "Type to queue a message… (Enter to queue)" : "Ask something… (Enter to send, hold ⌘ ⌥ to dictate)"
-                  }
+                  placeholder={busy ? "Type to queue a message… (Enter to queue)" : "Ask something… (Enter to send, hold ⌘ ⌥ to dictate)"}
                   className="p-3"
                   onChange={(e) => ctl.setDraft(chatId, e.target.value)}
                   onKeyDown={(e) => {
@@ -1139,41 +1189,10 @@ export default function App() {
                     }
                   }}
                 />
-                <InputGroupAddon align="block-end">
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild>
-                      <InputGroupButton size="sm" className={MODES.find((m) => m.id === s.mode)?.tone} title="Permission mode (Shift+Tab to change)">
-                        {MODES.find((m) => m.id === s.mode)?.label}
-                        <ChevronDownIcon />
-                      </InputGroupButton>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="start" className="w-72">
-                      <DropdownMenuRadioGroup value={s.mode} onValueChange={(v) => changeMode(v as Mode)}>
-                        {MODES.map((m) => (
-                          <DropdownMenuRadioItem key={m.id} value={m.id} className="items-start">
-                            <span className="flex flex-col">
-                              <span className={m.tone}>{m.label}</span>
-                              <span className="text-xs font-normal text-muted-foreground">{m.hint}</span>
-                            </span>
-                          </DropdownMenuRadioItem>
-                        ))}
-                      </DropdownMenuRadioGroup>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                  <ModelPicker
-                    apiKey={apiKey}
-                    value={model}
-                    disabled={busy}
-                    onChange={(id) => {
-                      setModel(id);
-                      setSetting("model", id);
-                    }}
-                  />
-                  <ContextMeter breakdown={breakdown} lastRequest={lastUsage} />
+                <InputGroupAddon align="inline-end" className="self-end">
                   <InputGroupButton
                     size="icon-sm"
                     variant={dictation === "recording" ? "destructive" : "ghost"}
-                    className="ml-auto"
                     onClick={() => (dictation === "recording" ? stopDictation() : startDictation())}
                     disabled={dictation === "working"}
                     aria-label="Dictate (or hold ⌘ ⌥)"
@@ -1181,13 +1200,7 @@ export default function App() {
                     {dictation === "working" ? <Spinner /> : dictation === "recording" ? <SquareIcon /> : <MicIcon />}
                   </InputGroupButton>
                   {busy ? (
-                    <InputGroupButton
-                      size="icon-sm"
-                      variant="default"
-                      className="rounded-full"
-                      onClick={stop}
-                      aria-label="Stop"
-                    >
+                    <InputGroupButton size="icon-sm" variant="default" className="rounded-full" onClick={stop} aria-label="Stop">
                       <SquareIcon />
                     </InputGroupButton>
                   ) : (
@@ -1204,8 +1217,47 @@ export default function App() {
                   )}
                 </InputGroupAddon>
               </InputGroup>
+              <div className="flex items-center gap-1 px-2 pt-1 text-muted-foreground">
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <InputGroupButton
+                      size="sm"
+                      className={MODES.find((m) => m.id === s.mode)?.tone}
+                      title="Permission mode (Shift+Tab to change)"
+                    >
+                      {MODES.find((m) => m.id === s.mode)?.label}
+                      <ChevronDownIcon />
+                    </InputGroupButton>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start" className="w-72">
+                    <DropdownMenuRadioGroup value={s.mode} onValueChange={(v) => changeMode(v as Mode)}>
+                      {MODES.map((m) => (
+                        <DropdownMenuRadioItem key={m.id} value={m.id} className="items-start">
+                          <span className="flex flex-col">
+                            <span className={m.tone}>{m.label}</span>
+                            <span className="text-xs font-normal text-muted-foreground">{m.hint}</span>
+                          </span>
+                        </DropdownMenuRadioItem>
+                      ))}
+                    </DropdownMenuRadioGroup>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+                <div className="ml-auto flex items-center gap-1">
+                  <ModelPicker
+                    apiKey={apiKey}
+                    value={model}
+                    disabled={busy}
+                    onChange={(id) => {
+                      setModel(id);
+                      setSetting("model", id);
+                    }}
+                  />
+                  <ContextMeter breakdown={breakdown} lastRequest={lastUsage} />
+                </div>
+              </div>
             </form>
           </div>
+          {isEmpty && <div className="flex-1" />}
         </SidebarInset>
 
         {activityOpen && (
@@ -1272,9 +1324,11 @@ export default function App() {
           )}
           {revertPlan && revertPlan.summary.conflicts > 0 && (
             <p className="text-sm text-muted-foreground">
-              {revertPlan.summary.conflicts === 1 ? "One file was" : `${revertPlan.summary.conflicts} files were`} changed since the agent wrote
-              {revertPlan.summary.conflicts === 1 ? " it" : " them"}. "Undo the rest" leaves {revertPlan.summary.conflicts === 1 ? "it" : "them"} alone; "Overwrite everything" puts back
-              the agent's starting version and loses your changes.
+              {revertPlan.summary.conflicts === 1 ? "One file was" : `${revertPlan.summary.conflicts} files were`} changed since the agent
+              wrote
+              {revertPlan.summary.conflicts === 1 ? " it" : " them"}. "Undo the rest" leaves{" "}
+              {revertPlan.summary.conflicts === 1 ? "it" : "them"} alone; "Overwrite everything" puts back the agent's starting version and
+              loses your changes.
             </p>
           )}
           <AlertDialogFooter>
@@ -1284,7 +1338,9 @@ export default function App() {
                 Overwrite everything
               </Button>
             )}
-            <Button onClick={() => confirmRevert(false)}>{revertPlan && revertPlan.summary.conflicts > 0 ? "Undo the rest" : "Undo"}</Button>
+            <Button onClick={() => confirmRevert(false)}>
+              {revertPlan && revertPlan.summary.conflicts > 0 ? "Undo the rest" : "Undo"}
+            </Button>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
@@ -1301,7 +1357,10 @@ export default function App() {
           busy={busy}
           onCommitted={(summary) => {
             ctl.setNotice(chatId, `Committed ${changesFor}: ${summary}`);
-            ctl.emit(chatId, { category: "chat", summary: `You committed in ${changesFor}: ${summary}` });
+            ctl.emit(chatId, {
+              category: "chat",
+              summary: `You committed in ${changesFor}: ${summary}`,
+            });
             void refreshGit([changesFor]);
           }}
         />
@@ -1314,9 +1373,10 @@ export default function App() {
           <AlertDialogHeader>
             <AlertDialogTitle>Resend this message?</AlertDialogTitle>
             <AlertDialogDescription>
-              Editing a message restarts the conversation from that point. Branch off to keep this chat as it is, or replace
-              everything after the message in this chat.
-              {editChoice && actedIn(messages.slice(editChoice.index + 1)) &&
+              Editing a message restarts the conversation from that point. Branch off to keep this chat as it is, or replace everything
+              after the message in this chat.
+              {editChoice &&
+                actedIn(messages.slice(editChoice.index + 1)) &&
                 " Neither choice undoes commands the agent already ran, and a new chat starts with the files as they are now."}
             </AlertDialogDescription>
           </AlertDialogHeader>
@@ -1324,7 +1384,8 @@ export default function App() {
             <div className="flex items-center gap-2">
               <Checkbox id="undo-edit" checked={undoDiscarded} onCheckedChange={(v) => setUndoDiscarded(v === true)} />
               <Label htmlFor="undo-edit">
-                When replacing, also undo the {filesFrom(changed, editChoice.index)} file {filesFrom(changed, editChoice.index) === 1 ? "change" : "changes"} made after this message
+                When replacing, also undo the {filesFrom(changed, editChoice.index)} file{" "}
+                {filesFrom(changed, editChoice.index) === 1 ? "change" : "changes"} made after this message
               </Label>
             </div>
           )}
