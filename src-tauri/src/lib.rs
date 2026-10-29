@@ -1135,7 +1135,9 @@ mod tests {
     /// Makes `link` a directory junction to `target` (no special privilege needed, unlike symlinks).
     #[cfg(windows)]
     fn junction(link: &str, target: &str) {
-        let status = Command::new("cmd").args(["/C", "mklink", "/J", link, target]).output().unwrap();
+        // mklink treats a forward slash as a switch, so the paths must use backslashes.
+        let (link, target) = (link.replace('/', "\\"), target.replace('/', "\\"));
+        let status = Command::new("cmd").args(["/C", "mklink", "/J", &link, &target]).output().unwrap();
         assert!(status.status.success(), "mklink failed: {status:?}");
     }
 
